@@ -3,6 +3,7 @@ package main
 // -------------------------------------------------------------------------------------
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 	"LoadBalanceProvider/src/balancer"
 	"LoadBalanceProvider/src/benchmark"
 	"LoadBalanceProvider/src/config"
+	"LoadBalanceProvider/src/desktop"
 	"LoadBalanceProvider/src/history"
 	"LoadBalanceProvider/src/keyusage"
 	"LoadBalanceProvider/src/notification"
@@ -191,6 +193,14 @@ func ensureAgentProperties(_agentPath string, _samplePath string) error {
 
 // -------------------------------------------------------------------------------------
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--desktop" {
+		cleanup, err := desktop.Prepare()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "安裝版啟動失敗:", err)
+			os.Exit(1)
+		}
+		defer cleanup()
+	}
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	Tools.EnableUncaughtExceptionHandler("Load Balance Provider", 3, func() { Tools.Log.Print(Tools.LL_Info, "System Error !!") })

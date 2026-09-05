@@ -1,5 +1,27 @@
 # LoadBalanceProvider 安裝說明
 
+## DMG／MSI 安裝版
+
+安裝包是既有 Web 管理服務的桌面啟動方式，不另建原生管理視窗，也不自動註冊開機服務。
+
+- **macOS**：開啟 DMG，將 `LoadBalanceProvider.app` 拖到「應用程式」。啟動 App 後會開啟 Terminal 並執行服務。
+- **Windows**：執行符合 CPU 架構的 MSI，安裝至 Program Files，需要系統管理員權限。完成後由開始功能表啟動 `LoadBalanceProvider`，服務在主控台視窗執行。
+- 啟動後以瀏覽器開啟設定的 HTTP 位址，首次安裝預設為 `http://localhost:10081`。停止服務請在服務視窗按 `Ctrl+C`；更新安裝前須先停止服務。
+- 安裝包不包含開發機的 `agent.properties`、Provider／金鑰資料、歷史紀錄或 `cmd/` 設定腳本。
+
+設定與用量資料位於使用者資料目錄，不寫入唯讀 App 或 Program Files：
+
+| 平台 | 資料目錄 |
+| :--- | :--- |
+| macOS | `~/Library/Application Support/LoadBalanceProvider/` |
+| Windows | `%LOCALAPPDATA%\LoadBalanceProvider\` |
+
+安裝版使用 `--desktop` 啟動模式，每次啟動同步封裝內的 Web 資源、題庫及版本資訊，並保留已存在的 `agent.properties`、`data/` 與 `usage/`。同一使用者資料目錄以檔案鎖避免重複啟動。原本 ZIP 部署的資料不會自動搬入；若要沿用，請先停止兩邊服務，再自行備份並移入上述目錄。
+
+安裝版不支援管理介面的 ZIP 自我更新，請使用新版 DMG／MSI 升級。移除 App 或解除安裝 MSI 不會刪除使用者設定與統計。正式 DMG 含 Developer ID 簽章與公證；檔名含 `-local` 的 DMG 僅供本地使用，含 `-unsigned` 的 MSI 尚未簽章。簽章狀態請以同版本的 `SIGNING_STATUS.txt` 為準。
+
+以下章節說明原有部署 ZIP 的安裝方式；建立安裝包請參考 [部署手冊](DEPLOY.md#dmgmsi-安裝包)。
+
 ## 封裝內容
 
 部署 zip 內會包含三個平台的執行檔：

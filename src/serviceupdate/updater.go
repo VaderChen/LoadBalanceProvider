@@ -20,7 +20,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -151,6 +150,9 @@ func ReadMultipartUpload(_contentType string, _body []byte) ([]byte, string, err
 func PrepareAndLaunch(_archive []byte, _fileName string) (Result, error) {
 	updateMu.Lock()
 	defer updateMu.Unlock()
+	if os.Getenv("LBP_DESKTOP_MODE") == "1" {
+		return Result{}, errors.New("DMG／MSI 安裝版請先停止服務，再使用新版安裝包升級；不支援套用部署 ZIP")
+	}
 
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return Result{}, fmt.Errorf("目前不支援在 %s 平台執行自我更新", runtime.GOOS)
@@ -266,7 +268,7 @@ func PrepareAndLaunch(_archive []byte, _fileName string) (Result, error) {
 		_command = exec.Command("systemd-run", _runArgs...)
 	} else {
 		_command = exec.Command("/bin/sh", append([]string{_scriptPath}, _scriptArgs...)...)
-		_command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		detachUpdateProcess(_command)
 	}
 	_command.Stdout = _logFile
 	_command.Stderr = _logFile

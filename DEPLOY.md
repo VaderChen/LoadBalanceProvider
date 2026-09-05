@@ -49,6 +49,44 @@ Codex OAuth 的並發刷新依 token 儲存路徑與 Provider ID 序列化；同
 
 ## 部署步驟
 
+### DMG／MSI 安裝包
+
+在 macOS 執行 `./pack.command`，會另外建置 macOS Apple Silicon 的 DMG 與 Windows x64 的 MSI；既有 `build.command`／`build.sh` 仍負責 macOS／Linux 部署 ZIP，兩種流程互不取代。安裝包由目前原始碼重新編譯，不混用 `bin/` 中可能過期的執行檔，也不自動執行 Git、發布 Release 或安裝到本機。
+
+必要工具為 Go、Xcode Command Line Tools、`hdiutil`、`codesign`、`xcrun`、`shasum`，以及 msitools 的 `wixl`；Windows ARM64 另需 `msibuild`。正式 DMG 需要 Developer ID Application 簽章身分與有效的 notarytool Keychain Profile。
+
+```bash
+./pack.command
+
+# 僅建立本地驗證用版本，不送出 Apple 公證
+./pack.command --local
+
+# 沿用 dist 中最新安裝版的執行檔及資源，重新封裝
+./pack.command --no-build
+
+# 指定版本與目標架構
+LBP_PACKAGE_VERSION='1.26.0906 build 1200' \
+LBP_BUILD_TARGETS='darwin/arm64,windows/amd64,windows/arm64' \
+./pack.command
+```
+
+| 環境變數 | 用途 |
+| :--- | :--- |
+| `LBP_PACKAGE_VERSION` | 顯示版本，格式為 `1.YY.MMDD build HHmm`；預設使用台北時間。 |
+| `LBP_BUILD_TARGETS` | 預設 `darwin/arm64,windows/amd64`；支援兩個 OS 的 `arm64`／`amd64`，且須同時包含 macOS 與 Windows。 |
+| `LBP_CODESIGN_IDENTITY` | 指定 Developer ID Application；未設定時尋找本機可用身分。 |
+| `LBP_NOTARY_PROFILE` | notarytool Keychain Profile 名稱，預設 `VaderApp`。不在腳本中保存 Apple ID 或密碼。 |
+| `LBP_WIXL` | 自訂 `wixl` 執行檔路徑。 |
+| `LBP_MSI_SIGN_COMMAND` | 可選的 MSI 簽章程式路徑，第一個參數為待簽章 MSI；須原地產出簽章檔，並以 `osslsigncode verify` 驗證成功後才列為已簽章。 |
+
+輸出位於 `dist/1.YY.MMDD-build-HHmm/` 的平台子目錄。已存在的版本不會直接覆蓋，重新封裝請使用 `--no-build`；可搭配 `LBP_PACKAGE_VERSION` 選擇特定版本。只有全部選定平台封裝完成後，才產生本輪的 `PACKAGES-SHA256SUMS` 與 `SIGNING_STATUS.txt`。前者是完整性檢查碼，不等同程式簽章；後者明確記錄每個安裝包的簽章狀態。
+
+正式 DMG 依序簽署服務執行檔與 App、對 App 公證並附加票根，再建立、簽署及公證 DMG。`--local` 產物檔名含 `-local`，只使用 adhoc 簽章，未公證，不可當作正式發行檔。未設定 Windows 簽章程式時，MSI 檔名含 `-unsigned`，Windows 可能顯示未知發行者；不會因雜湊驗證成功就宣稱通過 SmartScreen。
+
+MSI 包含開始功能表捷徑與升級／移除資訊。版本排序包含日期及當日分鐘，避免同一天的新版本被視為相同版本；同版本重新封裝保留相同產品識別碼。安裝前請停止服務。安裝與移除不清除使用者資料，詳見 [安裝說明](install.md#dmgmsi-安裝版)。
+
+### ZIP／原始碼部署
+
 1. 設定 Provider API key：
 
    ```bash
