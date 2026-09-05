@@ -2,7 +2,7 @@
 
 [繁體中文](README.md) | [English](README.en.md) | **日本語** | [한국어](README.ko.md)
 
-`LoadBalanceProvider` は MarsCloud SDK で構築された LLM プロキシサービスです。OpenAI 互換の Chat Completions API と Responses API を提供し、リクエストサイズ、処理負荷、タスク特性、Provider のリアルタイム負荷に基づいて、適切なバックエンド LLM Provider を選択します。
+`LoadBalanceProvider` は LLM プロキシサービスです。OpenAI 互換の Chat Completions API と Responses API を提供し、リクエストサイズ、処理負荷、タスク特性、Provider のリアルタイム負荷に基づいて、適切なバックエンド LLM Provider を選択します。
 
 ## 目的と機能
 
@@ -17,7 +17,7 @@
 
 ## ディレクトリ構成
 
-- `src/cmd/loadbalanceprovider/main.go`：MarsService、HTTP API、LLM Proxy コンポーネントを初期化するサービスエントリポイント。
+- `src/cmd/loadbalanceprovider/main.go`：サービスフレームワーク、HTTP API、LLM Proxy コンポーネントを初期化するサービスエントリポイント。
 - `src/service/cloud_service.go`：サービスのライフサイクルとバックグラウンドの Provider 状態記録。
 - `src/api/http_api.go`：`/v1/chat/completions`、`/v1/responses`、`/api/health`、`/api/providers` を含む REST API ルート。
 - `src/api/mcp.go`：標準 MCP Streamable HTTP、JSON-RPC ライフサイクル、ツールカタログ、既存 API アダプター。
@@ -27,7 +27,7 @@
 - `src/balancer/load_balancer.go`：Provider/Model 候補のフィルタリング、スコアリング、リアルタイム負荷の追跡。
 - `src/keyusage/recorder.go`：API キーの月次利用量と、直近 1 時間のリクエスト密度および Token 消費量を記録します。
 - `src/proxy/client.go`：OpenAI-compatible Chat Completion の HTTP 転送とストリーミングプロキシ。
-- `agent.properties`：MarsCloud サービス設定。
+- `agent.properties`：サービスの基本設定。
 - `data/llm_proxy.json`：LLM Provider、モデル能力、ロードバランシング設定。
 
 ## API

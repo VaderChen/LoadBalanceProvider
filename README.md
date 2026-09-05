@@ -2,7 +2,7 @@
 
 **繁體中文** | [English](README.en.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-`LoadBalanceProvider` 是一個以 MarsCloud SDK 建立的 LLM Proxy 服務。服務提供 OpenAI Chat Completions 與 Responses 相容 API，並依照請求內容大小、工作量、工作性質與 Provider 即時負載，選擇合適的後端 LLM Provider 處理。
+`LoadBalanceProvider` 是一個 LLM Proxy 服務。服務提供 OpenAI Chat Completions 與 Responses 相容 API，並依照請求內容大小、工作量、工作性質與 Provider 即時負載，選擇合適的後端 LLM Provider 處理。
 
 ## 功能目標
 
@@ -17,7 +17,7 @@
 
 ## 目錄結構
 
-- `src/cmd/loadbalanceprovider/main.go`：服務進入點，初始化 MarsService、HTTP API 與 LLM Proxy 元件。
+- `src/cmd/loadbalanceprovider/main.go`：服務進入點，初始化服務框架、HTTP API 與 LLM Proxy 元件。
 - `src/service/cloud_service.go`：服務生命週期與背景 Provider 狀態記錄。
 - `src/api/http_api.go`：REST API 路由，包含 `/v1/chat/completions`、`/v1/responses`、`/api/health`、`/api/providers`。
 - `src/api/mcp.go`：標準 MCP Streamable HTTP、JSON-RPC 生命週期、工具目錄與既有 API 轉接。
@@ -28,7 +28,7 @@
 - `src/keyusage/recorder.go`：API 金鑰每月用量，以及最近一小時的請求密度與 Token 消耗統計。
 - `src/telemetry/request.go`：從 Chat／Responses 請求抽取工具呼叫、工具輪次、工具輸出量、續接與重複任務訊號。
 - `src/proxy/client.go`：OpenAI-compatible Chat Completion HTTP 轉發與串流代理。
-- `agent.properties`：MarsCloud 服務設定。
+- `agent.properties`：服務基本設定。
 - `data/llm_proxy.json`：LLM Provider、模型能力與負載平衡設定。
 
 ## API
@@ -239,7 +239,7 @@ model_provider = "mars-llm-proxy"
 # END Mars LLM Proxy managed settings
 
 [model_providers.mars-llm-proxy]
-name = "Mars"
+name = "LoadBalanceProvider"
 base_url = "https://proxy.example.com/v1"
 env_key = "MARS_API_KEY"
 wire_api = "responses"

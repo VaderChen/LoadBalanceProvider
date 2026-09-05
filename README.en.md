@@ -2,7 +2,7 @@
 
 [繁體中文](README.md) | **English** | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-`LoadBalanceProvider` is an LLM proxy service built with the MarsCloud SDK. It provides OpenAI-compatible Chat Completions and Responses APIs, and selects an appropriate backend LLM provider based on request size, workload, task characteristics, and real-time provider load.
+`LoadBalanceProvider` is an LLM proxy service. It provides OpenAI-compatible Chat Completions and Responses APIs, and selects an appropriate backend LLM provider based on request size, workload, task characteristics, and real-time provider load.
 
 ## Goals
 
@@ -17,7 +17,7 @@
 
 ## Project Structure
 
-- `src/cmd/loadbalanceprovider/main.go`: Service entry point that initializes MarsService, the HTTP API, and LLM proxy components.
+- `src/cmd/loadbalanceprovider/main.go`: Service entry point that initializes the service framework, the HTTP API, and LLM proxy components.
 - `src/service/cloud_service.go`: Service lifecycle and background provider status recording.
 - `src/api/http_api.go`: REST API routes, including `/v1/chat/completions`, `/v1/responses`, `/api/health`, and `/api/providers`.
 - `src/api/mcp.go`: Standard MCP Streamable HTTP transport, JSON-RPC lifecycle, tool catalog, and adapters for existing APIs.
@@ -27,7 +27,7 @@
 - `src/balancer/load_balancer.go`: Filters and scores provider/model candidates and tracks real-time load.
 - `src/keyusage/recorder.go`: Records monthly API-key usage and the most recent hour of request density and token consumption.
 - `src/proxy/client.go`: Proxies OpenAI-compatible Chat Completions requests and streaming responses.
-- `agent.properties`: MarsCloud service configuration.
+- `agent.properties`: Basic service configuration.
 - `data/llm_proxy.json`: LLM provider, model capability, and load-balancing configuration.
 
 ## API

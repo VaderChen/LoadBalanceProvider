@@ -94,7 +94,7 @@ agent.sample.properties
 agent.sample.properties -> agent.properties
 ```
 
-部署後請依實際環境修改 `agent.properties`，例如 Mars Cloud 連線資訊、HTTP port、HTTPS port 與 web path。
+部署後請依實際環境修改 `agent.properties`，例如雲端服務連線資訊、HTTP port、HTTPS port 與 web path。
 
 ## 支援平台
 
@@ -130,16 +130,16 @@ Invoke-WebRequest https://example.com/downloads/marsCodexApp.bat -OutFile marsCo
 
 `example.com` 不是真實腳本位置，部署文件不會揭露正式下載網址。
 
-這些工具會偵測目前使用者的 Codex 設定目錄，不使用寫死的帳號或家目錄。套用 Mars 來源時會：
+這些工具會偵測目前使用者的 Codex 設定目錄，不使用寫死的帳號或家目錄。套用代理服務來源時會：
 
 - 寫入使用者環境變數 `MARS_API_KEY`。
 - 下載完整 Codex model catalog。
-- 設定 Mars Responses Provider。
-- 啟用 Codex 影像生成功能與 Mars MCP `image_gen` 工具。
-- 合併現有 `config.toml`，保留 `[projects."..."]` 與其他非 Mars 設定。
+- 設定代理服務的 Responses Provider。
+- 啟用 Codex 影像生成功能與代理服務的 MCP `image_gen` 工具。
+- 合併現有 `config.toml`，保留 `[projects."..."]` 與其他非工具管理的設定。
 
-工具仍會建立 `config.toml.mars-llm-proxy.bak` 作為緊急備份，但正常「恢復 Codex 原始設定」不會使用該檔案覆蓋。恢復流程只會移除 Mars 管理內容、model catalog 與 `MARS_API_KEY`，並還原套用前的作用中 Provider；因此目前的專案信任及其他個人設定會保留。
+工具仍會建立 `config.toml.mars-llm-proxy.bak` 作為緊急備份，但正常「恢復 Codex 原始設定」不會使用該檔案覆蓋。恢復流程只會移除工具管理內容、model catalog 與 `MARS_API_KEY`，並還原套用前的作用中 Provider；因此目前的專案信任及其他個人設定會保留。
 
-若 `config.toml` 已經定義其他 Provider 或 Profile，這些區段不會被移除。工具會把原本的頂層 `model`、`model_provider`、`model_catalog_json`、`profile` 保存至 `config.toml.mars-llm-proxy.defaults`，再將 model／Provider／catalog 切換到 Mars，並暫時清除可能衝突的作用中 profile。恢復時會把原值寫回，因此可以和既有 Provider 共存，也能回到套用前的預設來源。
+若 `config.toml` 已經定義其他 Provider 或 Profile，這些區段不會被移除。工具會把原本的頂層 `model`、`model_provider`、`model_catalog_json`、`profile` 保存至 `config.toml.mars-llm-proxy.defaults`，再將 model／Provider／catalog 切換到代理服務來源，並暫時清除可能衝突的作用中 profile。恢復時會把原值寫回，因此可以和既有 Provider 共存，也能回到套用前的預設來源。
 
 若備份檔已存在，可選擇覆蓋或保留；兩種選擇都不會中止後續套用。操作完成後必須完整重啟 Codex App、CLI 或 VS Code Extension Host。
