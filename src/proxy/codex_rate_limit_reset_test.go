@@ -101,3 +101,46 @@ func TestCodexRateLimitResetConsumeRequestOmitsCreditWithoutDetails(t *testing.T
 		t.Fatalf("request body = %s, want %s", _got, _want)
 	}
 }
+
+func TestCodexResetCreditDetailsListsAvailableCreditsByExpiry(t *testing.T) {
+	_count := int64(3)
+	_soon := "2030-09-21T00:05:00Z"
+	_later := "2030-10-04T02:06:00Z"
+	_payload := codexRateLimitResetCreditsPayload{
+		AvailableCount: &_count,
+		Credits: []codexRateLimitResetCreditPayload{
+			{ID: "unknown", Status: "available"},
+			{ID: "later", Status: "available", ExpiresAt: &_later},
+			{ID: "used", Status: "redeemed", ExpiresAt: &_soon},
+			{ID: " soon ", Status: "AVAILABLE", ExpiresAt: &_soon},
+			{ID: " ", Status: "available", ExpiresAt: &_soon},
+		},
+	}
+	_result := codexResetCreditDetails(_payload)
+	if _result.AvailableCount != 3 || !_result.HasCreditDetails || len(_result.Credits) != 3 {
+		t.Fatalf("unexpected credit details: %+v", _result)
+	}
+	for _i, _id := range []string{"soon", "later", "unknown"} {
+		if _result.Credits[_i].ID != _id {
+			t.Fatalf("credit %d = %q, want %q", _i, _result.Credits[_i].ID, _id)
+		}
+	}
+	if _result.NextExpiresAt == nil || *_result.NextExpiresAt != _soon || _result.Credits[1].ExpiresAt == nil || *_result.Credits[1].ExpiresAt != _later {
+		t.Fatal("credit expiry was not preserved")
+	}
+	if _payload.Credits[0].ID != "unknown" || _payload.Credits[3].ID != " soon " {
+		t.Fatal("modified upstream credit list")
+	}
+}
+
+func TestCodexResetCreditDetailsCountWithoutList(t *testing.T) {
+	_count := int64(2)
+	_result := codexResetCreditDetails(codexRateLimitResetCreditsPayload{AvailableCount: &_count})
+	if _result.AvailableCount != 2 || _result.HasCreditDetails || _result.NextExpiresAt != nil || _result.Credits == nil || len(_result.Credits) != 0 {
+		t.Fatalf("unexpected count-only fallback: %+v", _result)
+	}
+	_raw, _err := json.Marshal(_result.Credits)
+	if _err != nil || string(_raw) != "[]" {
+		t.Fatalf("expected empty JSON array, got %s (%v)", _raw, _err)
+	}
+}

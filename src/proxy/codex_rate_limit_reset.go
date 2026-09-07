@@ -26,6 +26,12 @@ type CodexRateLimitResetCredits struct {
 	AvailableCount   int64
 	NextExpiresAt    *string
 	HasCreditDetails bool
+	Credits          []CodexRateLimitResetCredit
+}
+
+type CodexRateLimitResetCredit struct {
+	ID        string  `json:"id"`
+	ExpiresAt *string `json:"expiresAt"`
 }
 
 // CodexRateLimitResetResult is the result of one idempotent reset-credit redemption.
@@ -72,12 +78,7 @@ func (_c *Client) GetCodexRateLimitResetCredits(_ctx context.Context, _provider 
 	if _detailsErr == nil {
 		var _details codexRateLimitResetCreditsPayload
 		if _err := json.Unmarshal(_raw, &_details); _err == nil && _details.AvailableCount != nil && *_details.AvailableCount >= 0 {
-			_selected, _hasDetails := earliestExpiringCodexResetCredit(_details.Credits)
-			return CodexRateLimitResetCredits{
-				AvailableCount:   *_details.AvailableCount,
-				NextExpiresAt:    _selected.ExpiresAt,
-				HasCreditDetails: _hasDetails,
-			}, nil
+			return codexResetCreditDetails(_details), nil
 		} else if _err != nil {
 			_detailsErr = fmt.Errorf("decode Codex reset-credit response: %w", _err)
 		} else {
@@ -94,12 +95,7 @@ func (_c *Client) GetCodexRateLimitResetCredits(_ctx context.Context, _provider 
 		} else if _usage.RateLimitResetCredits == nil || _usage.RateLimitResetCredits.AvailableCount == nil || *_usage.RateLimitResetCredits.AvailableCount < 0 {
 			_usageErr = fmt.Errorf("Codex usage response does not contain reset-credit availability")
 		} else {
-			_selected, _hasDetails := earliestExpiringCodexResetCredit(_usage.RateLimitResetCredits.Credits)
-			return CodexRateLimitResetCredits{
-				AvailableCount:   *_usage.RateLimitResetCredits.AvailableCount,
-				NextExpiresAt:    _selected.ExpiresAt,
-				HasCreditDetails: _hasDetails,
-			}, nil
+			return codexResetCreditDetails(*_usage.RateLimitResetCredits), nil
 		}
 	}
 
@@ -108,7 +104,7 @@ func (_c *Client) GetCodexRateLimitResetCredits(_ctx context.Context, _provider 
 
 // ConsumeCodexRateLimitResetCredit redeems one available credit. Reusing the same
 // idempotency key is safe when an earlier request has an uncertain transport outcome.
-func (_c *Client) ConsumeCodexRateLimitResetCredit(_ctx context.Context, _provider *domain.LLMProviderConfig, _idempotencyKey string) (CodexRateLimitResetResult, error) {
+func (_c *Client) ConsumeCodexRateLimitResetCredit(_ctx context.Context, _provider *domain.LLMProviderConfig, _idempotencyKey, _creditID string) (CodexRateLimitResetResult, error) {
 	if !isOpenAICodexProviderConfig(_provider) {
 		return CodexRateLimitResetResult{}, fmt.Errorf("rate-limit reset requires an OpenAI Codex provider")
 	}
@@ -117,14 +113,16 @@ func (_c *Client) ConsumeCodexRateLimitResetCredit(_ctx context.Context, _provid
 		return CodexRateLimitResetResult{}, fmt.Errorf("reset idempotency key is required")
 	}
 
-	// 先讀取最新明細，明確指定最早到期的可用 credit。若上游只提供數量，
-	// 保留原本不指定 credit_id 的行為，交由上游選擇下一筆可用項目。
-	_creditID := ""
-	_detailsURL := codexAccountAPIURL(_provider, "rate-limit-reset-credits")
-	if _raw, _detailsErr := _c.requestCodexAccountAPI(_ctx, _provider, http.MethodGet, _detailsURL, nil, codexResetCreditReadTimeout); _detailsErr == nil {
-		var _details codexRateLimitResetCreditsPayload
-		if json.Unmarshal(_raw, &_details) == nil {
-			_creditID = earliestExpiringCodexResetCreditID(_details.Credits)
+	// 指定券時交由上游驗證並處理冪等重試，不改選其他券。
+	// 未指定券的舊呼叫端仍沿用最早到期優先的行為。
+	_creditID = strings.TrimSpace(_creditID)
+	if _creditID == "" {
+		_detailsURL := codexAccountAPIURL(_provider, "rate-limit-reset-credits")
+		if _raw, _detailsErr := _c.requestCodexAccountAPI(_ctx, _provider, http.MethodGet, _detailsURL, nil, codexResetCreditReadTimeout); _detailsErr == nil {
+			var _details codexRateLimitResetCreditsPayload
+			if json.Unmarshal(_raw, &_details) == nil {
+				_creditID = earliestExpiringCodexResetCreditID(_details.Credits)
+			}
 		}
 	}
 
@@ -163,6 +161,30 @@ func earliestExpiringCodexResetCreditID(_credits []codexRateLimitResetCreditPayl
 }
 
 func earliestExpiringCodexResetCredit(_credits []codexRateLimitResetCreditPayload) (codexRateLimitResetCreditPayload, bool) {
+	_available := availableCodexResetCredits(_credits)
+	if len(_available) == 0 {
+		return codexRateLimitResetCreditPayload{}, false
+	}
+	return _available[0], true
+}
+
+func codexResetCreditDetails(_payload codexRateLimitResetCreditsPayload) CodexRateLimitResetCredits {
+	_available := availableCodexResetCredits(_payload.Credits)
+	_result := CodexRateLimitResetCredits{
+		AvailableCount:   *_payload.AvailableCount,
+		HasCreditDetails: len(_available) > 0,
+		Credits:          make([]CodexRateLimitResetCredit, 0, len(_available)),
+	}
+	for _, _credit := range _available {
+		_result.Credits = append(_result.Credits, CodexRateLimitResetCredit{ID: _credit.ID, ExpiresAt: _credit.ExpiresAt})
+	}
+	if len(_available) > 0 {
+		_result.NextExpiresAt = _available[0].ExpiresAt
+	}
+	return _result
+}
+
+func availableCodexResetCredits(_credits []codexRateLimitResetCreditPayload) []codexRateLimitResetCreditPayload {
 	_available := make([]codexRateLimitResetCreditPayload, 0, len(_credits))
 	for _, _credit := range _credits {
 		_credit.ID = strings.TrimSpace(_credit.ID)
@@ -171,10 +193,6 @@ func earliestExpiringCodexResetCredit(_credits []codexRateLimitResetCreditPayloa
 		}
 		_available = append(_available, _credit)
 	}
-	if len(_available) == 0 {
-		return codexRateLimitResetCreditPayload{}, false
-	}
-
 	sort.SliceStable(_available, func(_i, _j int) bool {
 		_iExpiresAt, _iOK := codexResetCreditExpiry(_available[_i].ExpiresAt)
 		_jExpiresAt, _jOK := codexResetCreditExpiry(_available[_j].ExpiresAt)
@@ -186,7 +204,7 @@ func earliestExpiringCodexResetCredit(_credits []codexRateLimitResetCreditPayloa
 		}
 		return _iExpiresAt.Before(_jExpiresAt)
 	})
-	return _available[0], true
+	return _available
 }
 
 func codexResetCreditExpiry(_value *string) (time.Time, bool) {

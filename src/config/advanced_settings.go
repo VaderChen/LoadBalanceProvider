@@ -36,10 +36,15 @@ const (
 // -------------------------------------------------------------------------------------
 func DefaultAdvancedSettingsConfig() domain.AdvancedSettingsConfig {
 	return domain.AdvancedSettingsConfig{
+		ProviderRetryRounds:                      2,
+		ProviderRetrySourcesPerRound:             0,
+		ProviderRetryWaitSeconds:                 30,
+		PersistQuotaCooldown:                     true,
 		ConversationAffinityTTLMinutes:           30,
 		ConversationAffinityQuotaTolerancePoints: 10,
 		ResponseRouteMaxEntries:                  2000,
 		ProviderCapacityCooldownSeconds:          10,
+		ProviderServerErrorCooldownSeconds:       30,
 		MaxBindingsPerProvider:                   8,
 		YieldLowMaxPercent:                       2,
 		YieldMidMaxPercent:                       20,
@@ -120,6 +125,11 @@ func SaveAdvancedSettingsConfig(_path string, _config domain.AdvancedSettingsCon
 
 // -------------------------------------------------------------------------------------
 func ValidateAdvancedSettingsConfig(_config domain.AdvancedSettingsConfig) error {
+	if _config.ProviderRetryRounds < 0 || _config.ProviderRetryRounds > 10 ||
+		_config.ProviderRetrySourcesPerRound < 0 || _config.ProviderRetrySourcesPerRound > 100 ||
+		_config.ProviderRetryWaitSeconds < 0 || _config.ProviderRetryWaitSeconds > 300 {
+		return fmt.Errorf("重試額外輪數須為 0–10、每輪來源上限須為 0–100、累計等待須為 0–300 秒")
+	}
 	if _config.ConversationAffinityTTLMinutes < MinConversationAffinityTTLMinutes ||
 		_config.ConversationAffinityTTLMinutes > MaxConversationAffinityTTLMinutes {
 		return fmt.Errorf("conversation affinity TTL must be between %d and %d minutes", MinConversationAffinityTTLMinutes, MaxConversationAffinityTTLMinutes)
@@ -133,6 +143,9 @@ func ValidateAdvancedSettingsConfig(_config domain.AdvancedSettingsConfig) error
 	if _config.ProviderCapacityCooldownSeconds < MinProviderCapacityCooldownSecs ||
 		_config.ProviderCapacityCooldownSeconds > MaxProviderCapacityCooldownSecs {
 		return fmt.Errorf("provider capacity cooldown must be between %d and %d seconds", MinProviderCapacityCooldownSecs, MaxProviderCapacityCooldownSecs)
+	}
+	if _config.ProviderServerErrorCooldownSeconds < 1 || _config.ProviderServerErrorCooldownSeconds > 300 {
+		return fmt.Errorf("上游伺服器錯誤冷卻必須是 1 到 300 秒的整數")
 	}
 	if _config.MaxBindingsPerProvider < MinBindingsPerProvider ||
 		_config.MaxBindingsPerProvider > MaxBindingsPerProviderLimit {

@@ -19,7 +19,7 @@ type failoverSmokeTransport func(*http.Request) (*http.Response, error)
 
 func (f failoverSmokeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestProviderFailoverKeepsDownstreamSmoke(t *testing.T) {
+func TestSameProviderRetryKeepsDownstreamSmoke(t *testing.T) {
 	for _, mode := range []string{"recover", "exhausted", "tool_started"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := &domain.ProxyConfig{RetryCount: 1}
@@ -54,6 +54,7 @@ func TestProviderFailoverKeepsDownstreamSmoke(t *testing.T) {
 					io.WriteString(writer, "data: {\"type\":\"response.in_progress\",\"sequence_number\":2}\n\n")
 					if mode == "tool_started" {
 						io.WriteString(writer, "data: {\"type\":\"response.output_item.added\",\"sequence_number\":3,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"exec\",\"arguments\":\"\"}}\n\n")
+						io.WriteString(writer, "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\"}\n\n")
 					}
 					if attempt == 1 {
 						select {
@@ -104,7 +105,7 @@ func TestProviderFailoverKeepsDownstreamSmoke(t *testing.T) {
 					t.Fatalf("tool request was replayed or unterminated: %v %s", providers, output)
 				}
 			} else {
-				if len(providers) != 2 || providers[0] == providers[1] || requests[0] != requests[1] {
+				if len(providers) != 2 || providers[0] != providers[1] || requests[0] != requests[1] {
 					t.Fatalf("invalid replay: providers=%v requests=%v", providers, requests)
 				}
 				if strings.Contains(output, "resp_discard") {

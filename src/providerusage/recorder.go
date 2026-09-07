@@ -35,6 +35,7 @@ type Recorder struct {
 
 // -------------------------------------------------------------------------------------
 type DayUsage struct {
+	MeasurementVersion     int     `json:"measurement_version,omitempty"`
 	UsedPercent            float64 `json:"used_percent"`
 	RemainingPercent       float64 `json:"remaining_percent"`
 	Observations           int64   `json:"observations"`
@@ -67,6 +68,7 @@ type MonthFile struct {
 
 // -------------------------------------------------------------------------------------
 type DayStat struct {
+	QualityWarning   bool    `json:"quality_warning,omitempty"`
 	Date             string  `json:"date"`
 	UsagePercent     float64 `json:"usage_percent"`
 	RemainingPercent float64 `json:"remaining_percent"`
@@ -136,6 +138,9 @@ func (_r *Recorder) Record(_providerID string, _usedPercent float64, _remainingP
 		_provider.Days = map[string]DayUsage{}
 	}
 	_dayUsage := _provider.Days[_day]
+	if !_dayUsage.CurrentKnown && !_dayUsage.StartKnown && !_dayUsage.EndKnown && _dayUsage.Observations == 0 {
+		_dayUsage.MeasurementVersion = 1
+	}
 	_dayUsage.UsedPercent = _usedPercent
 	_dayUsage.RemainingPercent = _remainingPercent
 	recordRemainingObservation(&_dayUsage, _remainingPercent, _at.Format(time.RFC3339))
@@ -194,6 +199,9 @@ func (_r *Recorder) recordDayBoundary(_providerID string, _remainingPercent floa
 		_provider.Days = map[string]DayUsage{}
 	}
 	_dayUsage := _provider.Days[_day]
+	if !_dayUsage.CurrentKnown && !_dayUsage.StartKnown && !_dayUsage.EndKnown && _dayUsage.Observations == 0 {
+		_dayUsage.MeasurementVersion = 1
+	}
 	if _start {
 		// A restart shortly after midnight must not replace the original baseline.
 		if _dayUsage.StartKnown {
@@ -318,6 +326,7 @@ func (_r *Recorder) LoadMonth(_providerIDs []string, _month string) (MonthStats,
 	}
 
 	type _daySample struct {
+		QualityWarning   bool
 		UsagePercent     float64
 		RemainingPercent float64
 		Completed        bool
@@ -351,6 +360,7 @@ func (_r *Recorder) LoadMonth(_providerIDs []string, _month string) (MonthStats,
 				_usagePercent = math.Max(0, _startRemaining-_currentRemaining)
 			}
 			_byDay[_day] = append(_byDay[_day], _daySample{
+				QualityWarning:   _usage.MeasurementVersion == 0,
 				UsagePercent:     _usagePercent,
 				RemainingPercent: _currentRemaining,
 				Completed:        _completed,
@@ -363,12 +373,15 @@ func (_r *Recorder) LoadMonth(_providerIDs []string, _month string) (MonthStats,
 		var _usageTotal float64
 		var _remainingTotal float64
 		_completed := true
+		_qualityWarning := false
 		for _, _sample := range _samples {
+			_qualityWarning = _qualityWarning || _sample.QualityWarning
 			_usageTotal += _sample.UsagePercent
 			_remainingTotal += _sample.RemainingPercent
 			_completed = _completed && _sample.Completed
 		}
 		_days = append(_days, DayStat{
+			QualityWarning:   _qualityWarning,
 			Date:             _day,
 			UsagePercent:     roundUsagePercent(_usageTotal / float64(len(_samples))),
 			RemainingPercent: roundPercent(_remainingTotal / float64(len(_samples))),

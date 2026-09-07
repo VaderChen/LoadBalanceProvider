@@ -1695,6 +1695,29 @@
         border-left: 0;
       }
     }
+    #dashboardView .hero-row { gap: 12px; margin-bottom: 16px; }
+    #dashboardView .eyebrow { margin-bottom: 6px; }
+    #dashboardView h1 { font-size: 24px; }
+    #dashboardView .dashboard-update-status { margin-bottom: 10px; font-size: 12px; }
+    #dashboardView .metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    #dashboardView .speed-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    #dashboardView .metric-card { min-height: 96px; padding: 14px 12px; border-radius: 8px; }
+    #dashboardView .metric-label { margin-bottom: 8px; letter-spacing: 0; overflow-wrap: anywhere; }
+    #dashboardView .metric-value { font-size: 34px; overflow-wrap: anywhere; }
+    #dashboardView .panel { margin-bottom: 16px; border-radius: 8px; }
+    #dashboardView .panel-header { min-height: 40px; height: auto; padding: 5px 16px; flex-wrap: wrap; }
+    #dashboardView .speed-item { min-height: 78px; padding: 16px; }
+    #dashboardView .small-label { margin-bottom: 5px; }
+    #dashboardView .small-value { font-size: 21px; overflow-wrap: anywhere; }
+    #dashboardView .provider-cell { min-height: 88px; padding: 12px 16px; }
+    #dashboardView .provider-name { margin-bottom: 6px; }
+    @media (max-width: 1000px) {
+      #dashboardView .metric-grid, #dashboardView .speed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #dashboardView .speed-item { border: 0; }
+      #dashboardView .speed-item:nth-child(even) { border-left: 1px solid var(--line-soft); }
+      #dashboardView .speed-item:nth-child(n+3) { border-top: 1px solid var(--line-soft); }
+      #dashboardView .controls { gap: 8px; }
+    }
   </style>
 </head>
 <body>
@@ -1795,7 +1818,7 @@
         </article>
         <button class="metric-card metric-card-button" type="button" id="totalRemainingCard" title="查看每日總用量百分比" aria-label="查看可使用量的每日用量百分比" aria-haspopup="dialog">
           <div>
-            <div class="metric-label">可使用量</div>
+            <div class="metric-label" id="totalRemainingLabel">可使用量</div>
             <div class="metric-value" id="totalRemaining" title="無限制">∞</div>
           </div>
         </button>
@@ -2055,6 +2078,26 @@
                     <label class="field">
                       <span>容量冷卻（秒）</span>
                       <input class="text-input" id="providerCapacityCooldownSeconds" type="number" min="1" max="300" step="1" inputmode="numeric">
+                    </label>
+                    <label class="field">
+                      <span>上游伺服器錯誤冷卻（秒）</span>
+                      <input class="text-input" id="providerServerErrorCooldownSeconds" type="number" min="1" max="300" step="1" inputmode="numeric">
+                    </label>
+                    <label class="field">
+                      <span>額外重試輪數</span>
+                      <input class="text-input" id="providerRetryRounds" type="number" min="0" max="10" step="1" inputmode="numeric">
+                    </label>
+                    <label class="field">
+                      <span>每輪來源上限（0 為不限）</span>
+                      <input class="text-input" id="providerRetrySourcesPerRound" type="number" min="0" max="100" step="1" inputmode="numeric">
+                    </label>
+                    <label class="field">
+                      <span>累計冷卻等待上限（秒）</span>
+                      <input class="text-input" id="providerRetryWaitSeconds" type="number" min="0" max="300" step="1" inputmode="numeric">
+                    </label>
+                    <label class="field">
+                      <span>保存長時間配額冷卻</span>
+                      <input id="persistQuotaCooldown" type="checkbox">
                     </label>
                     <label class="field">
                       <span>每 Provider 綁定上限</span>
@@ -2382,6 +2425,7 @@
       providers: [],
       status: [],
       metricMode: localStorage.getItem("lbp.dashboard.metricMode") || "session",
+      quotaCache: new Map(),
       keyTab: localStorage.getItem("lbp.settings.keyTab") || "chat",
       keyTypeFilter: localStorage.getItem("lbp.settings.keyTypeFilter") || "all",
       keyPage: 1,
@@ -2405,6 +2449,11 @@
         conversationAffinityQuotaTolerancePoints: 10,
         responseRouteMaxEntries: 2000,
         providerCapacityCooldownSeconds: 10,
+        providerServerErrorCooldownSeconds: 30,
+        providerRetryRounds: 2,
+        providerRetrySourcesPerRound: 0,
+        providerRetryWaitSeconds: 30,
+        persistQuotaCooldown: true,
         maxBindingsPerProvider: 8,
         yieldLowMaxPercent: 2,
         yieldMidMaxPercent: 20,
@@ -2566,6 +2615,11 @@
       conversationAffinityQuotaTolerancePoints: document.getElementById("conversationAffinityQuotaTolerancePoints"),
       responseRouteMaxEntries: document.getElementById("responseRouteMaxEntries"),
       providerCapacityCooldownSeconds: document.getElementById("providerCapacityCooldownSeconds"),
+      providerServerErrorCooldownSeconds: document.getElementById("providerServerErrorCooldownSeconds"),
+      providerRetryRounds: document.getElementById("providerRetryRounds"),
+      providerRetrySourcesPerRound: document.getElementById("providerRetrySourcesPerRound"),
+      providerRetryWaitSeconds: document.getElementById("providerRetryWaitSeconds"),
+      persistQuotaCooldown: document.getElementById("persistQuotaCooldown"),
       maxBindingsPerProvider: document.getElementById("maxBindingsPerProvider"),
       yieldLowMaxPercent: document.getElementById("yieldLowMaxPercent"),
       yieldMidMaxPercent: document.getElementById("yieldMidMaxPercent"),
@@ -2988,12 +3042,29 @@
       const cumulativeRequests = filteredStatus.reduce((sum, item) => sum + cumulativeRequestCount(item), 0);
       const cumulativeResponseTokens = filteredStatus.reduce((sum, item) => sum + cumulativeCompletionTokens(item), 0);
       const enabledProviderIDs = new Set(state.providers.filter(provider => provider.enabled).map(provider => provider.id));
-      const enabledRemainingValues = state.status
-        .filter(item => enabledProviderIDs.has(item.id))
-        .map(minimumProviderRemainingPercent)
-        .filter(value => value !== null);
-      const totalRemaining = enabled > 0 && enabledRemainingValues.length
-        ? enabledRemainingValues.reduce((sum, value) => sum + value, 0) / enabled
+      for (const id of state.quotaCache.keys()) {
+        if (!enabledProviderIDs.has(id)) state.quotaCache.delete(id);
+      }
+      let staleQuotaCount = 0;
+      const enabledRemainingValues = [];
+      for (const provider of state.providers.filter(provider => provider.enabled)) {
+        const identity = JSON.stringify([provider.id, provider.kind, provider.type, provider.base_url]);
+        const item = statusMap.get(provider.id);
+        const value = item ? minimumProviderRemainingPercent(item) : null;
+        let cached = state.quotaCache.get(provider.id);
+        if (cached && cached.identity !== identity) cached = null;
+        if (value !== null) {
+          const capturedAt = Date.parse(item.usage?.updated_at || "");
+          cached = { identity, value, capturedAt: Number.isFinite(capturedAt) ? capturedAt : 0 };
+          state.quotaCache.set(provider.id, cached);
+        }
+        if (cached) {
+          enabledRemainingValues.push(cached.value);
+          if (value === null || Date.now() - cached.capturedAt > 120000) staleQuotaCount++;
+        }
+      }
+      const totalRemaining = enabledRemainingValues.length
+        ? enabledRemainingValues.reduce((sum, value) => sum + value, 0) / enabledRemainingValues.length
         : null;
       const timingSamples = filteredStatus.map(item => ({
         reaction: displayReactionTime(item),
@@ -3021,13 +3092,12 @@
       els.activeRequestsLabel.textContent = cumulativeMode ? "累積請求" : "目前活躍請求";
       els.activeRequests.textContent = cumulativeMode ? (statisticsReady ? formatCumulativeCount(cumulativeRequests) : "--") : String(active);
       // 尚未取得配額與確定無限制是不同狀態，缺少資料時不當成零或無限額度。
-      const quotaReady = state.dashboardInitialized && state.providers.filter(provider => provider.enabled).every(provider => {
-        const item = statusMap.get(provider.id);
-        return item && providerHasUsageInfo(item, item.usage || {});
-      });
-      const unlimitedQuota = quotaReady && totalRemaining === null;
-      els.totalRemaining.textContent = !quotaReady ? "--" : unlimitedQuota ? "∞" : percentText(totalRemaining);
-      els.totalRemaining.title = !quotaReady ? "待更新" : unlimitedQuota ? "無限制" : "";
+      const quotaReady = state.dashboardInitialized && totalRemaining !== null;
+      els.totalRemaining.textContent = quotaReady ? percentText(totalRemaining) : "--";
+      document.getElementById("totalRemainingLabel").textContent = staleQuotaCount > 0 ? "可使用量（含舊值）" : "可使用量";
+      els.totalRemaining.title = quotaReady
+        ? `已取得配額的 Provider 平均值（${enabledRemainingValues.length} / ${enabled}）；${staleQuotaCount} 個來源使用最後有效值`
+        : enabled > 0 ? "尚未取得可計算的配額資料" : "沒有啟用的 Provider";
       els.tokenSpeed.textContent = `${formatSpeed(avgTokenSpeed)} tok/s`;
       els.streamOutSpeed.textContent = `${formatSpeed(avgStreamOutSpeed)} tok/s`;
       els.loadBar.style.width = `${loadPercent}%`;
@@ -3489,13 +3559,13 @@
 
     function addUsagePercent(values, value) {
       const number = usageNumber(value);
-      if (number === null) return;
+      if (number === null || number < 0 || number > 100) return;
       values.push(Math.max(0, Math.min(100, number)));
     }
 
     function addRemainingFromUsedPercent(values, value) {
       const number = usageNumber(value);
-      if (number === null) return;
+      if (number === null || number < 0 || number > 100) return;
       values.push(Math.max(0, Math.min(100, 100 - number)));
     }
 
@@ -3523,7 +3593,7 @@
     function addLimitRemainingPercent(values, limit, remaining) {
       const limitNumber = usageNumber(limit);
       const remainingNumber = usageNumber(remaining);
-      if (limitNumber === null || remainingNumber === null || limitNumber <= 0) return;
+      if (limitNumber === null || remainingNumber === null || limitNumber <= 0 || remainingNumber < 0 || remainingNumber > limitNumber) return;
       values.push(Math.max(0, Math.min(100, (remainingNumber / limitNumber) * 100)));
     }
 
@@ -3881,6 +3951,11 @@
       els.conversationAffinityQuotaTolerancePoints.value = advanced.conversationAffinityQuotaTolerancePoints ?? 10;
       els.responseRouteMaxEntries.value = advanced.responseRouteMaxEntries ?? 2000;
       els.providerCapacityCooldownSeconds.value = advanced.providerCapacityCooldownSeconds ?? 10;
+      els.providerServerErrorCooldownSeconds.value = advanced.providerServerErrorCooldownSeconds ?? 30;
+      els.providerRetryRounds.value = advanced.providerRetryRounds ?? 2;
+      els.providerRetrySourcesPerRound.value = advanced.providerRetrySourcesPerRound ?? 0;
+      els.providerRetryWaitSeconds.value = advanced.providerRetryWaitSeconds ?? 30;
+      els.persistQuotaCooldown.checked = advanced.persistQuotaCooldown ?? true;
       els.maxBindingsPerProvider.value = advanced.maxBindingsPerProvider ?? 8;
       els.yieldLowMaxPercent.value = advanced.yieldLowMaxPercent ?? 2;
       els.yieldMidMaxPercent.value = advanced.yieldMidMaxPercent ?? 20;
@@ -3898,6 +3973,11 @@
         conversationAffinityQuotaTolerancePoints: Number(els.conversationAffinityQuotaTolerancePoints.value),
         responseRouteMaxEntries: Number(els.responseRouteMaxEntries.value),
         providerCapacityCooldownSeconds: Number(els.providerCapacityCooldownSeconds.value),
+        providerServerErrorCooldownSeconds: Number(els.providerServerErrorCooldownSeconds.value),
+        providerRetryRounds: Number(els.providerRetryRounds.value),
+        providerRetrySourcesPerRound: Number(els.providerRetrySourcesPerRound.value),
+        providerRetryWaitSeconds: Number(els.providerRetryWaitSeconds.value),
+        persistQuotaCooldown: els.persistQuotaCooldown.checked,
         maxBindingsPerProvider: Number(els.maxBindingsPerProvider.value)
       };
       if (!Number.isInteger(settings.conversationAffinityTTLMinutes) || settings.conversationAffinityTTLMinutes < 1 || settings.conversationAffinityTTLMinutes > 10080) {
@@ -3911,6 +3991,14 @@
       }
       if (!Number.isInteger(settings.providerCapacityCooldownSeconds) || settings.providerCapacityCooldownSeconds < 1 || settings.providerCapacityCooldownSeconds > 300) {
         throw new Error("容量冷卻必須是 1 到 300 秒的整數。");
+      }
+      if (!Number.isInteger(settings.providerServerErrorCooldownSeconds) || settings.providerServerErrorCooldownSeconds < 1 || settings.providerServerErrorCooldownSeconds > 300) {
+        throw new Error("上游伺服器錯誤冷卻必須是 1 到 300 秒的整數。");
+      }
+      for (const [key, max, label] of [["providerRetryRounds", 10, "額外重試輪數"], ["providerRetrySourcesPerRound", 100, "每輪來源上限"], ["providerRetryWaitSeconds", 300, "累計冷卻等待上限"]]) {
+        if (!Number.isInteger(settings[key]) || settings[key] < 0 || settings[key] > max) {
+          throw new Error(`${label}必須是 0 到 ${max} 的整數。`);
+        }
       }
       if (!Number.isInteger(settings.maxBindingsPerProvider) || settings.maxBindingsPerProvider < 1 || settings.maxBindingsPerProvider > 1000) {
         throw new Error("每 Provider 綁定上限必須是 1 到 1000 的整數。");
@@ -4683,9 +4771,11 @@
           const providerCount = Number(payload?.provider_count || 0);
           const observedDays = Number(payload?.observed_days || 0);
 	          els.providerUsageStatsSubtitle.textContent = `已啟用 ${providerCount} 個 Provider；每日用量 = 當日各額度週期的使用量累計`;
-	          els.providerUsageStatsMessage.textContent = observedDays > 0
+          const unverifiedDays = (payload?.days || []).filter(day => day.quality_warning).length;
+          els.providerUsageStatsMessage.textContent = observedDays > 0
 	            ? `${month} 已記錄 ${observedDays} 天額度資料；當日數值會隨最新用量動態更新，23:59 後完成結算。`
             : `${month} 尚無 Provider 額度紀錄。`;
+          if (unverifiedDays > 0) els.providerUsageStatsMessage.textContent += ` ${unverifiedDays} 天包含舊版未經完整性驗證的資料，僅供參考，未自動更改歷史用量。`;
         }
       } catch (err) {
         await renderProviderUsageChart({ month, days: [], provider_count: 0, observed_days: 0 });

@@ -2,6 +2,8 @@
 
 本文件說明 `LoadBalanceProvider` 的部署與設定方式。
 
+建置需要 Go 1.25.6 或相容的新版本。功能概覽請見 [README](README.md)，一般安裝與啟動請見 [安裝說明](install.md)。正式環境請啟用 HTTPS、限制管理入口，並將認證與資料目錄納入備份。
+
 ## 設定檔
 
 服務啟動時會讀取專案根目錄的 `agent.properties`、`data/llm_proxy.json` 與 `data/advanced_settings.json`。`agent.properties` 保留服務基本設定，LLM Provider 與負載平衡設定集中放在 `data/llm_proxy.json`；進階路由、輸出比分級與低推理降級設定保存在 `data/advanced_settings.json`。
@@ -9,13 +11,13 @@
 | 參數 | 說明 |
 | :--- | :--- |
 | `selection_strategy` | 負載平衡策略，目前預設 `random`，並保留 `weighted_score`。 |
-| `retry_count` | 尚未轉送有效內容時，遇到可重試故障可重新選路由的次數；文字或工具呼叫已送出後不再重播。 |
+| `retry_count` | 尚未轉送有效內容時允許的額外重試次數；選定後沿用原 Provider，另受固定來源重試上限限制。文字或工具參數已送出後不再重播。 |
 | `providers[].id` | Provider 唯一識別碼。 |
 | `providers[].base_url` | OpenAI-compatible Provider base URL。 |
 | `providers[].api_key_env` | API key 的環境變數名稱。 |
 | `providers[].chat_completions_path` | Chat Completions endpoint path。 |
 | `providers[].enabled` | 是否啟用此 Provider。 |
-| `providers[].weight` | 權重，數值越高越容易被選中。 |
+| `providers[].weight` | 加權評分策略使用的權重；隨機策略不以此保證流量比例。 |
 | `providers[].priority` | 優先序調整，數值越高會降低分數。 |
 | `providers[].max_concurrent` | 同時處理 request 上限。 |
 | `providers[].timeout_seconds` | 預設 `300` 秒；串流用於上游回應標頭等待與無進展逾時，而非整段串流的總時長。非串流請求仍受請求期限限制。 |
@@ -27,9 +29,15 @@
 
 ### 容量冷卻與 OAuth
 
-`data/advanced_settings.json` 的 `provider_capacity_cooldown_seconds` 為預設容量冷卻時間，預設 `10` 秒，可在管理介面的進階設定調整。上游回報有效 `Retry-After` 時優先採用該值。模型故障與帳號配額故障分開冷卻，同一有效窗口內的並發失敗不會重設冷卻期限，較早開始的請求成功也不會清除新的容量冷卻。
+可在管理介面的進階設定調整冷卻與等待。上游提供有效 `Retry-After` 時優先採用；暫時過載未提供提示時，採 2、4、8、16 秒加隨機偏移的退避。一般可重試伺服器錯誤預設冷卻 30 秒，模型故障與帳號配額故障分開處理。
 
-串流請求可在候選都處於容量冷卻時等待恢復，每個請求累計最多 `30` 秒；等待時間超過剩餘預算便回傳終止錯誤，不會無限保留請求。這是程式內建的冷卻等待預算，不是可編輯設定，也不是整段任務總時限。冷卻狀態僅保存在目前服務程序記憶體，重啟後重新累積。
+| 進階設定欄位 | 預設 | 用途 |
+| --- | --- | --- |
+| `provider_server_error_cooldown_seconds` | 30 | 一般伺服器錯誤冷卻，可設 1–300 秒。 |
+| `provider_retry_wait_seconds` | 30 | 每個請求累計冷卻等待預算，可設 0–300 秒；0 不等待。 |
+| `persist_quota_cooldown` | true | 保存仍有至少 5 分鐘的配額冷卻，重啟時驗證後恢復。 |
+
+選定後的請求只等待原 Provider，不因等待而切換來源。預算不包含上游生成耗時，也不是整段任務總時限。短暫故障冷卻在重啟後重新累積，長期配額冷卻可保存。選路輪數與每輪來源數設定不會覆寫固定來源規則。詳見 [連線與重試](RETRY_POLICY.md)。
 
 Codex OAuth 的並發刷新依 token 儲存路徑與 Provider ID 序列化；同一程序共用 token 儲存鎖，避免不同 Provider 寫入同一檔案時互相覆蓋。HTTP `401` 最多觸發一次刷新後重送，不套用於 API key 認證，也不重播已開始輸出的串流。多個服務程序之間不共用此鎖，請勿讓多個實例同時寫入同一份 token 檔案。
 
@@ -98,14 +106,14 @@ MSI 包含開始功能表捷徑與升級／移除資訊。版本排序包含日�
 3. 整理依賴並確認語法：
 
    ```bash
-   go mod tidy
-   go test ./...
+   go mod download
+   go build -buildvcs=false ./...
    ```
 
 4. 編譯：
 
    ```bash
-   go build -o LoadBalanceProvider ./src/cmd/loadbalanceprovider
+   go build -buildvcs=false -o LoadBalanceProvider ./src/cmd/loadbalanceprovider
    ```
 
 5. 啟動：
@@ -113,6 +121,18 @@ MSI 包含開始功能表捷徑與升級／移除資訊。版本排序包含日�
    ```bash
    ./LoadBalanceProvider
    ```
+
+## 發布與升級
+
+- macOS 正式 Release 僅附上已完成 Developer ID 簽章與公證的 DMG。
+- Windows 正式 Release 僅附上已驗證簽章的 MSI；不發布 `-unsigned` 安裝檔。
+- Linux ARM64 與 x86_64 發布 ZIP，不要求程式簽章；提供 SHA-256 供下載後驗證完整性。
+- `--local` 產物與未簽章的 macOS／Windows 程式不作為正式發行檔。發布說明使用英文。
+- `build.sh` 目前產出包含 macOS／Linux 三平台執行檔的部署 ZIP；正式 Linux 發行需分別整理各架構的 ZIP，不將此混合部署包當成已簽章的 macOS 發行檔。
+
+部署 ZIP 可從管理頁面「系統更新」升級。支援版本會在更新前保存路由快照，更新後恢復仍有效的 Provider 配對。更新會重新啟動服務，不保留進行中的連線；更新前請備份 `agent.properties`、`data/`、`usage/` 與自訂資料路徑。勿讓多個程序共用同一份可寫認證或配對檔。
+
+DMG／MSI 請使用對應的新版安裝包升級。詳細限制見 [對話配對與更新恢復](TURN_BINDING.md)。
 
 ## 維運端點
 
@@ -124,4 +144,4 @@ GET /api/api-keys/density?window=15m
 
 `/api/providers` 可查看目前各 Provider 的 active request、成功次數、失敗次數與模型設定摘要。
 
-`/api/api-keys/density` 是管理端即時監看端點，需使用有效的 Web 登入 Session；一般 API 金鑰與 MCP 金鑰不能存取。`window` 可使用秒數或 `1m`、`5m`、`15m`、`30m`、`1h`，最大觀察範圍為一小時。回應除了請求頻率與複雜度外，也包含 `prompt_tokens`、`quality_tier_avg`、輸出比 `output_ratio`／`output_ratio_median`、正文比 `prose_ratio`／`prose_ratio_median`／`prose_samples`、推理量 `reasoning_tokens`／`reasoning_ratio`、工具呼叫與輪次、續接與重複任務，以及 `yield_low`／`yield_mid`／`yield_high` 分布和目前套用的 `yield_thresholds`。輸出比以實際完成輸出 Token ÷ 估算輸入 Token 計算，預設分級門檻為 `≤2%`、`>2% 且 ≤20%`、`>20%`，可從管理介面的進階設定調整。舊版 `os_tool_ratio`、`tool_type_counts` 與 OS 工具分類已移除。最近逐筆樣本僅保存在記憶體，服務重啟後會重新累積；月次永久統計不受影響。
+`/api/api-keys/density` 僅供 Web 管理登入使用，可查看近期請求密度、Token 與輸出結構；一般 API 金鑰與 MCP 金鑰不能存取。最近逐筆樣本在服務重啟後重新累積，月次統計另行保存。

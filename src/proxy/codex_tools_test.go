@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"LoadBalanceProvider/src/domain"
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -63,8 +64,60 @@ func TestBuildCodexResponsesRequestKeepsToolRoundHistory(t *testing.T) {
 		t.Fatalf("function call history = %#v", call)
 	}
 	output := payload.Input[2]
-	if output.Type != "function_call_output" || output.CallID != "call_1" || output.Output != `{"files":["README.md"]}` {
+	if output.Type != "function_call_output" || output.CallID != "call_1" || output.Output == nil || *output.Output != `{"files":["README.md"]}` {
 		t.Fatalf("function output history = %#v", output)
+	}
+}
+
+func TestBuildCodexResponsesRequestSerializesToolOutput(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		content interface{}
+		want    string
+	}{
+		{name: "empty string", content: "", want: ""},
+		{name: "null content", content: nil, want: ""},
+		{name: "empty parts", content: []interface{}{}, want: ""},
+		{name: "empty text part", content: []interface{}{map[string]interface{}{"type": "text", "text": ""}}, want: ""},
+		{name: "whitespace", content: " \n\t", want: " \n\t"},
+		{name: "nonempty", content: `{"ok":true}`, want: `{"ok":true}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &domain.ChatCompletionRequest{Messages: []domain.ChatMessage{
+				{Role: "user", Content: "Run the tool"},
+				{Role: "assistant", ToolCalls: []domain.ChatToolCall{{
+					ID: "call_1", Type: "function", Function: domain.ChatFunctionCall{Name: "run", Arguments: "{}"},
+				}}},
+				{Role: "tool", ToolCallID: "call_1", Content: test.content},
+			}}
+			payload := buildCodexResponsesRequest(request, "test-model", &domain.LLMProviderConfig{Kind: "openai-codex"})
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded struct {
+				Input []map[string]json.RawMessage `json:"input"`
+			}
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if len(decoded.Input) != 3 {
+				t.Fatalf("unexpected serialized history: %s", raw)
+			}
+			for _, index := range []int{0, 1} {
+				if _, exists := decoded.Input[index]["output"]; exists {
+					t.Fatalf("non-output item has output field: %s", raw)
+				}
+			}
+			output, exists := decoded.Input[2]["output"]
+			want, err := json.Marshal(test.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !exists || string(output) != string(want) || string(decoded.Input[2]["call_id"]) != `"call_1"` {
+				t.Fatalf("serialized tool output = %s, want %s; payload: %s", output, want, raw)
+			}
+		})
 	}
 }
 

@@ -733,7 +733,7 @@ func TestUpstreamContentRejectionDoesNotPenalizeProviderHealth(t *testing.T) {
 		UpstreamRejected:  true,
 	}
 
-	recordProviderForwardFailure(_provider, _err, nil, time.Second, defaultProviderCapacityCooldown)
+	recordProviderForwardFailure(_provider, _err, nil, time.Second, defaultProviderCapacityCooldown, 30*time.Second)
 
 	if _provider.Failures != 0 || _provider.ConsecutiveFailures != 0 {
 		t.Fatalf("content rejection changed provider health: failures=%d consecutive=%d", _provider.Failures, _provider.ConsecutiveFailures)

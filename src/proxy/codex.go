@@ -52,7 +52,7 @@ type codexResponsesMessage struct {
 	CallID  string                      `json:"call_id,omitempty"`
 	Name    string                      `json:"name,omitempty"`
 	Args    string                      `json:"arguments,omitempty"`
-	Output  string                      `json:"output,omitempty"`
+	Output  *string                     `json:"output,omitempty"`
 }
 
 // -------------------------------------------------------------------------------------
@@ -360,10 +360,12 @@ func buildCodexResponsesRequest(_chatReq *domain.ChatCompletionRequest, _model s
 		case "tool":
 			callID := strings.TrimSpace(msg.ToolCallID)
 			if callID != "" {
+				// 工具結果即使為空字串，仍須送出必要的 output 欄位。
+				output := messageContentText(msg.Content)
 				messages = append(messages, codexResponsesMessage{
 					Type:   "function_call_output",
 					CallID: callID,
-					Output: messageContentText(msg.Content),
+					Output: &output,
 				})
 			} else if len(parts) > 0 {
 				messages = append(messages, codexResponsesMessage{Type: "message", Role: "user", Content: parts})

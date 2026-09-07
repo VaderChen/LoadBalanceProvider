@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
@@ -48,8 +49,12 @@ type ProviderRuntime struct {
 	Successes                int64
 	Failures                 int64
 	ConsecutiveFailures      int64
+	overloadLock             sync.Mutex
+	consecutiveOverloads     int
+	overloadUntil            time.Time
 	CircuitOpenUntil         int64
 	CapacityUnavailableUntil int64
+	QuotaUnavailableUntil    int64
 	_latencyLock             sync.Mutex
 	LatencyEWMA50MS          float64
 	LatencyEWMA95MS          float64
@@ -342,9 +347,13 @@ func (_b *LoadBalancer) noAvailableProviderError(_req *domain.ChatCompletionRequ
 				continue
 			}
 			_matchingProviders++
-			_until := _provider.ModelUnavailableUntil(_model.Name)
+			_until := _provider.CooldownUntil(_model.Name)
 			if _accountUntil := time.Unix(0, atomic.LoadInt64(&_provider.CapacityUnavailableUntil)); _accountUntil.After(_until) {
 				_until = _accountUntil
+			}
+			// 併發滿載短暫等待後重查，仍受請求等待預算限制。
+			if !_until.After(_now) && _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.Active) >= _provider.Config.MaxConcurrent {
+				_until = _now.Add(time.Second)
 			}
 			if !_until.After(_now) {
 				continue
@@ -1042,6 +1051,13 @@ func (_p *ProviderRuntime) MarkSuccessWithMetrics(_latency time.Duration, _compl
 	_clientDeliveryTPS = NormalizeTokenRate(int64(_completionTokens), _durationMS, _clientDeliveryTPS)
 	atomic.AddInt64(&_p.Successes, 1)
 	atomic.StoreInt64(&_p.ConsecutiveFailures, 0)
+	_p.overloadLock.Lock()
+	// 冷卻期間完成的既有請求不代表來源已恢復，不能清除這一波退避。
+	if !time.Now().Before(_p.overloadUntil) {
+		_p.consecutiveOverloads = 0
+		_p.overloadUntil = time.Time{}
+	}
+	_p.overloadLock.Unlock()
 	atomic.StoreInt64(&_p.CircuitOpenUntil, 0)
 	_p.ClearAuthError()
 	_p.recordLatency(_latency)
@@ -1061,6 +1077,27 @@ func (_p *ProviderRuntime) MarkFailure(_latency time.Duration) {
 }
 
 // -------------------------------------------------------------------------------------
+// NextOverloadBackoff 共用連續過載次數；明確的上游等待時間不受本地上限限制。
+func (_p *ProviderRuntime) NextOverloadBackoff(retryAfter time.Duration) time.Duration {
+	_p.overloadLock.Lock()
+	defer _p.overloadLock.Unlock()
+	now := time.Now()
+	if _p.overloadUntil.After(now) {
+		// 同一窗口不重抽亂數或升級；僅明確的較長 Retry-After 可延長。
+		if retryAfter > 0 && now.Add(retryAfter).After(_p.overloadUntil) {
+			_p.overloadUntil = now.Add(retryAfter)
+		}
+		return _p.overloadUntil.Sub(now)
+	}
+	_p.consecutiveOverloads = min(_p.consecutiveOverloads+1, 4)
+	delay := retryAfter
+	if delay <= 0 {
+		delay = (2*time.Second)<<uint(_p.consecutiveOverloads-1) + time.Duration(rand.Int64N(int64(time.Second)))
+	}
+	_p.overloadUntil = now.Add(delay)
+	return delay
+}
+
 func (_p *ProviderRuntime) MarkTemporaryUnavailable(_latency time.Duration, _duration time.Duration) {
 	if _duration <= 0 {
 		_duration = 30 * time.Second
@@ -1070,7 +1107,7 @@ func (_p *ProviderRuntime) MarkTemporaryUnavailable(_latency time.Duration, _dur
 	_until := time.Now().Add(_duration).UnixNano()
 	for {
 		_previous := atomic.LoadInt64(&_p.CapacityUnavailableUntil)
-		if _previous > time.Now().UnixNano() || atomic.CompareAndSwapInt64(&_p.CapacityUnavailableUntil, _previous, _until) {
+		if _previous >= _until || atomic.CompareAndSwapInt64(&_p.CapacityUnavailableUntil, _previous, _until) {
 			break
 		}
 	}
@@ -1084,7 +1121,7 @@ func (_p *ProviderRuntime) CircuitOpen(_now time.Time) bool {
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) CapacityUnavailable(_now time.Time) bool {
-	_until := atomic.LoadInt64(&_p.CapacityUnavailableUntil)
+	_until := max(atomic.LoadInt64(&_p.CapacityUnavailableUntil), atomic.LoadInt64(&_p.QuotaUnavailableUntil))
 	return _until > 0 && _now.UnixNano() < _until
 }
 
@@ -1119,7 +1156,16 @@ func (_p *ProviderRuntime) RecordUsageHeaders(_headers http.Header) {
 		return
 	}
 	_snapshot := buildProviderUsageSnapshot(_values)
+	_remaining, _known := _snapshot.KnownRemainingPercent()
+	if !_known {
+		return
+	}
 	_p._usageLock.Lock()
+	// 不用不完整的新快照取代完整的舊快照，避免統計在不同額度窗口間跳動。
+	if !_snapshot.coversUsage(_p.Usage) {
+		_p._usageLock.Unlock()
+		return
+	}
 	_p.Usage = _snapshot
 	_p._usageLock.Unlock()
 	if _p.Config == nil || !_snapshot.HasUsageInfo() {
@@ -1127,8 +1173,8 @@ func (_p *ProviderRuntime) RecordUsageHeaders(_headers http.Header) {
 	}
 	if _err := providerusage.DefaultRecorder().Record(
 		_p.Config.ID,
-		_snapshot.OverallUsagePercent(),
-		_snapshot.OverallRemainingPercent(),
+		100-_remaining,
+		_remaining,
 		_snapshot.UpdatedAt,
 	); _err != nil {
 		log.Printf("provider usage history record failed: provider=%s error=%v", _p.Config.ID, _err)
@@ -1414,48 +1460,24 @@ func codexUsagePercentFromHeader(_text string) (float64, float64) {
 
 // -------------------------------------------------------------------------------------
 func (_s ProviderUsageSnapshot) OverallUsagePercent() float64 {
-	_values := []float64{
-		_s.RequestUsagePercent,
-		_s.TokenUsagePercent,
-		_s.CodexPrimaryUsedPercent,
-		_s.CodexSecondaryUsedPercent,
+	if remaining, ok := _s.KnownRemainingPercent(); ok {
+		return 100 - remaining
 	}
-	return maxPositive(_values...)
+	return 0
 }
 
 // -------------------------------------------------------------------------------------
 func (_s ProviderUsageSnapshot) HasUsageInfo() bool {
-	if _s.UpdatedAt.IsZero() {
-		return false
-	}
-	if strings.TrimSpace(_s.LimitRequests) != "" || strings.TrimSpace(_s.RemainingRequests) != "" ||
-		strings.TrimSpace(_s.LimitTokens) != "" || strings.TrimSpace(_s.RemainingTokens) != "" {
-		return true
-	}
-	if len(_s.Headers) == 0 {
-		return false
-	}
-	for _key := range _s.Headers {
-		_key = strings.ToLower(strings.TrimSpace(_key))
-		if strings.Contains(_key, "used-percent") ||
-			strings.Contains(_key, "remaining") ||
-			strings.Contains(_key, "limit") {
-			return true
-		}
-	}
-	return false
+	_, known := _s.KnownRemainingPercent()
+	return !_s.UpdatedAt.IsZero() && known
 }
 
 // -------------------------------------------------------------------------------------
 func (_s ProviderUsageSnapshot) OverallRemainingPercent() float64 {
-	_usage := _s.OverallUsagePercent()
-	if _usage <= 0 {
-		if _s.HasUsageInfo() {
-			return maxPositive(_s.RequestRemainingPercent, _s.TokenRemainingPercent, _s.CodexPrimaryRemainPercent, _s.CodexSecondaryRemainPercent)
-		}
-		return 0
+	if remaining, ok := _s.KnownRemainingPercent(); ok {
+		return remaining
 	}
-	return clampPercent(100 - _usage)
+	return 0
 }
 
 // -------------------------------------------------------------------------------------
@@ -1679,6 +1701,20 @@ func (_p *ProviderRuntime) recordReaction(_reactionMS float64) {
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) copyRuntimeState(_old *ProviderRuntime) {
+	// 設定重載保留相同來源的冷卻，不讓儲存介面設定繞過退避。
+	if _p.Config.BaseURL == _old.Config.BaseURL && _p.Config.APIKey == _old.Config.APIKey && _p.Config.APIKeyEnv == _old.Config.APIKeyEnv && _p.Config.Kind == _old.Config.Kind {
+		_p.CapacityUnavailableUntil = atomic.LoadInt64(&_old.CapacityUnavailableUntil)
+		_p.QuotaUnavailableUntil = atomic.LoadInt64(&_old.QuotaUnavailableUntil)
+		_old.modelCooldownLock.Lock()
+		_p.modelCooldowns = make(map[string]time.Time, len(_old.modelCooldowns))
+		for k, v := range _old.modelCooldowns {
+			_p.modelCooldowns[k] = v
+		}
+		_old.modelCooldownLock.Unlock()
+		_old.overloadLock.Lock()
+		_p.consecutiveOverloads, _p.overloadUntil = _old.consecutiveOverloads, _old.overloadUntil
+		_old.overloadLock.Unlock()
+	}
 	_p.Successes = atomic.LoadInt64(&_old.Successes)
 	_p.Failures = atomic.LoadInt64(&_old.Failures)
 	_p.ConsecutiveFailures = atomic.LoadInt64(&_old.ConsecutiveFailures)

@@ -39,10 +39,15 @@ type GeneralSettingsConfig struct {
 
 // -------------------------------------------------------------------------------------
 type AdvancedSettingsConfig struct {
+	ProviderRetryRounds                      int     `json:"provider_retry_rounds"`
+	ProviderRetrySourcesPerRound             int     `json:"provider_retry_sources_per_round"`
+	ProviderRetryWaitSeconds                 int     `json:"provider_retry_wait_seconds"`
+	PersistQuotaCooldown                     bool    `json:"persist_quota_cooldown"`
 	ConversationAffinityTTLMinutes           int     `json:"conversation_affinity_ttl_minutes"`
 	ConversationAffinityQuotaTolerancePoints float64 `json:"conversation_affinity_quota_tolerance_points"`
 	ResponseRouteMaxEntries                  int     `json:"response_route_max_entries"`
 	ProviderCapacityCooldownSeconds          int     `json:"provider_capacity_cooldown_seconds"`
+	ProviderServerErrorCooldownSeconds       int     `json:"provider_server_error_cooldown_seconds"`
 	MaxBindingsPerProvider                   int     `json:"max_bindings_per_provider"`
 	YieldLowMaxPercent                       float64 `json:"yield_low_max_percent"`
 	YieldMidMaxPercent                       float64 `json:"yield_mid_max_percent"`

@@ -565,11 +565,7 @@
 
     .reset-credit-panel {
       grid-column: 1 / -1;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 8px 12px;
-      min-height: 42px;
+      min-width: 0;
       margin-top: 10px;
       padding-top: 12px;
       border-top: 1px solid var(--line);
@@ -579,20 +575,185 @@
       display: none;
     }
 
-    .reset-credit-copy {
+    .provider-settings {
+      grid-column: 1 / -1;
+      min-width: 0;
+    }
+
+    .provider-settings[hidden] {
+      display: none;
+    }
+
+    .billing-toolbar {
       display: flex;
-      align-items: baseline;
-      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 0 14px 12px;
+    }
+
+    .billing-spinner {
+      order: -1;
+      width: 16px;
+      height: 16px;
+      flex: 0 0 16px;
+      border: 2px solid var(--line);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: billing-spin .8s linear infinite;
+    }
+
+    @keyframes billing-spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .billing-spinner { animation: none; }
+    }
+
+    .billing-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, .8fr) 48px;
+      gap: 6px;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      padding: 10px;
+      font-size: 12px;
+    }
+
+    .billing-row > * {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      line-height: 1.6;
+    }
+
+    .billing-heading {
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    .billing-row .text-button {
+      width: 48px;
+      min-height: 32px;
+      padding: 4px;
+      font-size: 12px;
+      text-align: center;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .billing-message {
+      margin: 0;
+      padding: 0 14px 12px;
+      font-size: 13px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
+    .billing-message:empty { display: none; }
+    .billing-message.error { color: var(--danger); }
+
+    .billing-more {
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+    }
+
+    .provider-settings-fields {
+      min-width: 0;
+      padding: 14px;
+      border-top: 1px solid var(--line);
+    }
+
+    .provider-settings-summary span {
+      flex: 1;
+      min-width: 0;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .provider-settings,
+    .reset-credit-details {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .provider-settings-summary,
+    .reset-credit-summary {
+      display: flex;
+      align-items: center;
+      gap: 10px;
       min-width: 0;
       font-size: 14px;
+      padding: 12px 14px;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .provider-settings-summary::-webkit-details-marker,
+    .reset-credit-summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .provider-settings-summary::after,
+    .reset-credit-summary::after {
+      content: "";
+      width: 7px;
+      height: 7px;
+      flex: 0 0 7px;
+      border-right: 1px solid var(--muted);
+      border-bottom: 1px solid var(--muted);
+      transform: rotate(45deg);
+    }
+
+    .provider-settings[open] > summary::after,
+    .reset-credit-details[open] > summary::after {
+      transform: rotate(225deg);
     }
 
     .reset-credit-label {
       font-weight: 800;
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
 
     .reset-credit-count {
+      margin-left: auto;
+      flex-shrink: 0;
+      padding: 2px 8px;
+      border-radius: 8px;
+      color: #166534;
+      background: #dcfce7;
+    }
+
+    .reset-credit-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+      font-size: 14px;
+    }
+
+    .reset-credit-row strong {
+      display: block;
+      margin-bottom: 4px;
+      overflow-wrap: anywhere;
+    }
+
+    .reset-credit-expiry {
+      font-size: 13px;
+      line-height: 1.5;
       color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
+    .reset-credit-empty {
+      margin: 0;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
     }
 
     .reset-credit-status {
@@ -601,6 +762,7 @@
       color: var(--muted);
       font-size: 13px;
       line-height: 1.4;
+      margin-top: 8px;
     }
 
     .reset-credit-status:empty {
@@ -613,16 +775,19 @@
     }
 
     .text-button.reset-credit-use {
-      min-height: 36px;
-      color: var(--primary);
-      border-color: #a9cbbb;
+      min-height: 32px;
+      padding: 5px 10px;
+      font-size: 13px;
+      color: #fff;
+      background: #202326;
+      border-color: #202326;
       white-space: nowrap;
     }
 
     .text-button.reset-credit-use:hover:not(:disabled) {
       color: #fff;
-      border-color: var(--primary);
-      background: var(--primary);
+      border-color: #404448;
+      background: #404448;
     }
 
     .text-button:disabled {
@@ -902,50 +1067,70 @@
             </div>
           </div>
 
-          <div class="field full">
-            <label for="host">HOST</label>
-            <input id="host" name="host" autocomplete="off">
-          </div>
+          <details class="provider-settings" open>
+            <summary class="provider-settings-summary"><span>連線與模型設定</span></summary>
+            <div class="form-grid provider-settings-fields">
+              <div class="field full">
+                <label for="host">HOST</label>
+                <input id="host" name="host" autocomplete="off">
+              </div>
 
-          <div class="field full">
-            <label for="chatApi">Chat API</label>
-            <div class="with-check">
-              <input id="chatApi" name="chatApi" autocomplete="off">
-              <button class="check-button" type="button" id="validateButton" title="檢查 Chat API" aria-label="檢查 Chat API">✓</button>
+              <div class="field full">
+                <label for="chatApi">Chat API</label>
+                <div class="with-check">
+                  <input id="chatApi" name="chatApi" autocomplete="off">
+                  <button class="check-button" type="button" id="validateButton" title="檢查 Chat API" aria-label="檢查 Chat API">✓</button>
+                </div>
+              </div>
+
+              <div class="field">
+                <label for="modelName">預設模型</label>
+                <select id="modelName" name="model"></select>
+              </div>
+
+              <div class="field">
+                <label for="maxConcurrent">最大併發</label>
+                <input id="maxConcurrent" name="maxConcurrent" type="number" min="1" step="1">
+              </div>
+
+              <div class="field" id="reasoningEffortField">
+                <label for="reasoningEffort">預設推理程度</label>
+                <select id="reasoningEffort" name="reasoningEffort">
+                  <option value="">預設</option>
+                  <option value="none">none</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </div>
             </div>
-          </div>
-
-          <div class="field">
-            <label for="modelName">預設模型</label>
-            <select id="modelName" name="model"></select>
-          </div>
-
-          <div class="field">
-            <label for="maxConcurrent">最大併發</label>
-            <input id="maxConcurrent" name="maxConcurrent" type="number" min="1" step="1">
-          </div>
-
-          <div class="field" id="reasoningEffortField">
-            <label for="reasoningEffort">預設推理程度</label>
-            <select id="reasoningEffort" name="reasoningEffort">
-              <option value="">預設</option>
-              <option value="none">none</option>
-              <option value="minimal">minimal</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-              <option value="xhigh">xhigh</option>
-            </select>
-          </div>
+          </details>
 
           <div class="reset-credit-panel" id="resetCreditPanel" hidden>
-            <div class="reset-credit-copy">
-              <span class="reset-credit-label">用量上限重置</span>
-              <span class="reset-credit-count" id="resetCreditCount">載入中...</span>
-            </div>
-            <button class="text-button reset-credit-use" type="button" id="resetCreditButton" disabled>使用重置</button>
+            <details class="reset-credit-details" open>
+              <summary class="reset-credit-summary">
+                <span class="reset-credit-label">使用量限制重設</span>
+                <span class="reset-credit-count" id="resetCreditCount" aria-live="polite">載入中...</span>
+              </summary>
+              <div id="resetCreditList"></div>
+            </details>
             <div class="reset-credit-status" id="resetCreditStatus" aria-live="polite"></div>
           </div>
+
+          <details class="provider-settings" id="billingPanel" open hidden>
+            <summary class="provider-settings-summary"><span>帳單列表</span></summary>
+            <div class="billing-toolbar">
+              <button class="text-button" type="button" id="billingQuery">查詢</button>
+              <span class="billing-spinner" id="billingSpinner" aria-hidden="true" hidden></span>
+            </div>
+            <div class="billing-message" id="billingMessage" role="status" aria-live="polite"></div>
+            <div id="billingList" role="table" aria-label="帳單列表" aria-busy="false"></div>
+            <div class="billing-more" id="billingMoreRow" hidden>
+              <button class="text-button" type="button" id="billingMore">載入更多</button>
+            </div>
+          </details>
         </form>
 
         <aside class="side-block">
@@ -1106,15 +1291,30 @@
     let modelLoadSeq = 0;
     let resetCreditLoadSeq = 0;
     let resetCreditCount = null;
-    let resetCreditExpiresAt = null;
-    let resetCreditHasDetails = false;
+    let resetCredits = [];
     let pendingResetProviderId = "";
+    let pendingResetCreditId = "";
     let pendingResetIdempotencyKey = "";
+    let resetInFlight = false;
+    const resetCreditAttempts = new Map();
+    let billingProviderKey = "";
+    let billingLoadSeq = 0;
+    let billingAbort = null;
+    let billingTransactions = [];
+    let billingNextCursor = "";
+    let billingLoading = false;
     let draggedProviderId = "";
     const API_KEY_MASK = "••••••••••••";
 
     const providerList = document.getElementById("providerList");
     const providerForm = document.getElementById("providerForm");
+    const billingPanel = document.getElementById("billingPanel");
+    const billingQuery = document.getElementById("billingQuery");
+    const billingSpinner = document.getElementById("billingSpinner");
+    const billingList = document.getElementById("billingList");
+    const billingMessage = document.getElementById("billingMessage");
+    const billingMoreRow = document.getElementById("billingMoreRow");
+    const billingMore = document.getElementById("billingMore");
     const editorBody = document.getElementById("editorBody");
     const loadingOverlay = document.getElementById("loadingOverlay");
     const saveButton = document.getElementById("saveButton");
@@ -1131,7 +1331,7 @@
     const capabilityGrid = document.getElementById("capabilityGrid");
     const resetCreditPanel = document.getElementById("resetCreditPanel");
     const resetCreditCountLabel = document.getElementById("resetCreditCount");
-    const resetCreditButton = document.getElementById("resetCreditButton");
+    const resetCreditList = document.getElementById("resetCreditList");
     const resetCreditStatus = document.getElementById("resetCreditStatus");
     const resetConfirmDialog = document.getElementById("resetConfirmDialog");
     const resetConfirmText = document.getElementById("resetConfirmText");
@@ -1486,6 +1686,7 @@
         editorBody.querySelector(".side-block").hidden = true;
         resetCreditLoadSeq += 1;
         resetCreditPanel.hidden = true;
+        syncBillingPanel(null);
         return;
       }
 
@@ -1505,6 +1706,7 @@
       updateEditorHeader(provider);
       syncOAuthButton(provider);
       syncResetCreditPanel(provider);
+      syncBillingPanel(provider);
       renderCapabilities(provider);
       loadModelOptions(provider);
     }
@@ -1550,16 +1752,160 @@
       oauthButton.textContent = "OAuth 登入";
     }
 
+    function syncBillingPanel(provider) {
+      const supported = providerOAuthSupported(provider);
+      const key = JSON.stringify([provider?.id, provider?.kind, provider?.oauth, provider?.oauthAccount]);
+      billingPanel.hidden = !supported;
+      if (key === billingProviderKey) {
+        return;
+      }
+      billingProviderKey = key;
+      billingLoadSeq += 1;
+      billingAbort?.abort();
+      billingAbort = null;
+      billingLoading = false;
+      billingTransactions = [];
+      billingNextCursor = "";
+      billingList.replaceChildren();
+      billingList.setAttribute("aria-busy", "false");
+      billingMessage.textContent = "";
+      billingMessage.classList.remove("error");
+      billingSpinner.hidden = true;
+      billingMoreRow.hidden = true;
+      billingQuery.disabled = !supported || !provider?.id;
+    }
+
+    function billingInvoiceURL(raw) {
+      try {
+        const url = new URL(raw);
+        return url.protocol === "https:" && url.host === "invoice.stripe.com"
+          && !url.username && !url.password && url.pathname.startsWith("/i/") ? url.href : "";
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function renderBillingTransactions() {
+      billingList.replaceChildren();
+      const statuses = { paid: "已付款", open: "待付款", draft: "草稿", void: "已作廢", uncollectible: "無法收款" };
+      if (billingTransactions.length) {
+        const heading = document.createElement("div");
+        heading.className = "billing-row billing-heading";
+        heading.setAttribute("role", "row");
+        for (const label of ["日期", "金額", "狀態", "下載"]) {
+          const cell = document.createElement("span");
+          cell.setAttribute("role", "columnheader");
+          cell.textContent = label;
+          heading.append(cell);
+        }
+        billingList.append(heading);
+      }
+      for (const transaction of billingTransactions) {
+        const row = document.createElement("div");
+        row.className = "billing-row";
+        row.setAttribute("role", "row");
+        const date = new Date(transaction.created_at);
+        let amount = "金額未提供";
+        if (Number.isSafeInteger(transaction.amount) && /^[a-z]{3}$/i.test(transaction.currency || "")) {
+          try {
+            const formatter = new Intl.NumberFormat("zh-TW", { style: "currency", currency: transaction.currency.toUpperCase() });
+            amount = formatter.format(transaction.amount / 10 ** formatter.resolvedOptions().maximumFractionDigits);
+          } catch (_) {}
+        }
+        for (const value of [Number.isNaN(date.getTime()) ? "日期未提供" : date.toLocaleDateString("zh-TW"), amount, statuses[transaction.status] || transaction.status || "未知狀態"]) {
+          const span = document.createElement("span");
+          span.setAttribute("role", "cell");
+          span.textContent = value;
+          row.append(span);
+        }
+        const href = billingInvoiceURL(transaction.invoice_url);
+        const download = document.createElement(href ? "a" : "button");
+        download.className = "text-button";
+        download.textContent = "下載";
+        if (href) {
+          download.href = href;
+          download.target = "_blank";
+          download.rel = "noopener noreferrer";
+          download.referrerPolicy = "no-referrer";
+          download.title = "開啟帳單頁下載帳單或收據";
+        } else {
+          download.type = "button";
+          download.disabled = true;
+          download.title = "此交易未提供可用的帳單連結";
+        }
+        const action = document.createElement("span");
+        action.setAttribute("role", "cell");
+        action.append(download);
+        row.append(action);
+        billingList.append(row);
+      }
+      billingMoreRow.hidden = !billingNextCursor;
+    }
+
+    async function loadBillingTransactions(more = false) {
+      const provider = currentProvider();
+      if (!providerOAuthSupported(provider) || !provider.id || billingLoading || (more && !billingNextCursor)) {
+        return;
+      }
+      if (!provider.oauth) {
+        billingMessage.textContent = "請先連線 OAuth，再查詢帳單。";
+        billingMessage.classList.add("error");
+        return;
+      }
+      const ticket = ++billingLoadSeq;
+      const cursor = more ? billingNextCursor : "";
+      billingAbort = new AbortController();
+      billingLoading = true;
+      billingQuery.disabled = true;
+      billingMore.disabled = true;
+      billingSpinner.hidden = false;
+      billingList.setAttribute("aria-busy", "true");
+      billingMessage.textContent = "查詢中...";
+      billingMessage.classList.remove("error");
+      if (!more) {
+        billingTransactions = [];
+        billingNextCursor = "";
+        billingList.replaceChildren();
+        billingMoreRow.hidden = true;
+      }
+      try {
+        const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+        const payload = await apiRequest(`api/provider-configs/${encodeURIComponent(provider.id)}/billing${query}`, { signal: billingAbort.signal });
+        if (ticket !== billingLoadSeq || provider.id !== selectedId) return;
+        if (!Array.isArray(payload.transactions)) throw new Error("帳單回應格式不正確");
+        const unique = new Map(billingTransactions.map(item => [item.id, item]));
+        for (const transaction of payload.transactions) {
+          if (transaction && typeof transaction.id === "string" && transaction.id) unique.set(transaction.id, transaction);
+        }
+        billingTransactions = [...unique.values()].sort((a, b) => (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0));
+        billingNextCursor = typeof payload.next_cursor === "string" && payload.next_cursor !== cursor ? payload.next_cursor : "";
+        renderBillingTransactions();
+        billingMessage.textContent = billingTransactions.length ? "" : "目前沒有交易紀錄。";
+      } catch (err) {
+        if (ticket !== billingLoadSeq || provider.id !== selectedId || err.name === "AbortError") return;
+        billingMessage.textContent = err.message || "帳單查詢失敗，請重試。";
+        billingMessage.classList.add("error");
+      } finally {
+        if (ticket === billingLoadSeq) {
+          billingLoading = false;
+          billingAbort = null;
+          billingQuery.disabled = false;
+          billingMore.disabled = false;
+          billingSpinner.hidden = true;
+          billingList.setAttribute("aria-busy", "false");
+        }
+      }
+    }
+
     function syncResetCreditPanel(provider) {
       const supported = providerOAuthSupported(provider) && provider.oauth && provider.id;
       resetCreditLoadSeq += 1;
       resetCreditPanel.hidden = !supported;
       resetCreditCount = null;
-      resetCreditExpiresAt = null;
-      resetCreditHasDetails = false;
+      resetCredits = [];
       resetCreditStatus.textContent = "";
       resetCreditStatus.classList.remove("error");
-      resetCreditButton.disabled = true;
+      resetCreditList.replaceChildren();
       if (!supported) {
         return;
       }
@@ -1574,10 +1920,11 @@
           return;
         }
         resetCreditCount = Math.max(0, Number(payload.availableCount) || 0);
-        resetCreditExpiresAt = typeof payload.expiresAt === "string" ? payload.expiresAt : null;
-        resetCreditHasDetails = payload.hasCreditDetails === true;
+        resetCredits = Array.isArray(payload.credits)
+          ? payload.credits.filter(credit => credit && typeof credit.id === "string" && credit.id.trim())
+          : [];
         resetCreditCountLabel.textContent = `可用 ${resetCreditCount} 次`;
-        resetCreditButton.disabled = resetCreditCount < 1;
+        renderResetCredits();
         resetCreditStatus.textContent = "";
         resetCreditStatus.classList.remove("error");
       } catch (err) {
@@ -1585,10 +1932,9 @@
           return;
         }
         resetCreditCount = null;
-        resetCreditExpiresAt = null;
-        resetCreditHasDetails = false;
+        resetCredits = [];
         resetCreditCountLabel.textContent = "無法取得";
-        resetCreditButton.disabled = true;
+        resetCreditList.replaceChildren();
         resetCreditStatus.textContent = err.message || "無法取得重置次數";
         resetCreditStatus.classList.add("error");
       }
@@ -1602,16 +1948,45 @@
       return `reset-${Date.now()}-${randomPart}`;
     }
 
-    function formatResetCreditExpiry() {
-      if (!resetCreditHasDetails) {
-        return "上游未提供";
+    function renderResetCredits() {
+      resetCreditList.replaceChildren();
+      if (resetCreditCount < 1 || resetCredits.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "reset-credit-empty";
+        empty.textContent = resetCreditCount < 1 ? "目前沒有可用的重置券。" : "上游未提供重置券明細，暫時無法選取。";
+        resetCreditList.append(empty);
+        return;
       }
-      if (!resetCreditExpiresAt) {
-        return "無到期時間";
+      for (const credit of resetCredits) {
+        const row = document.createElement("div");
+        row.className = "reset-credit-row";
+        const copy = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = "完整重置";
+        const expiry = document.createElement("div");
+        expiry.className = "reset-credit-expiry";
+        expiry.textContent = `到期時間：${formatResetCreditExpiry(credit.expiresAt)}`;
+        expiry.title = credit.expiresAt || "";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "text-button reset-credit-use";
+        button.textContent = "使用重置";
+        button.disabled = resetInFlight || Date.parse(credit.expiresAt) <= Date.now();
+        button.setAttribute("aria-label", `使用重置，到期時間：${formatResetCreditExpiry(credit.expiresAt)}`);
+        button.addEventListener("click", () => openResetConfirmation(credit));
+        copy.append(title, expiry);
+        row.append(copy, button);
+        resetCreditList.append(row);
       }
-      const expiresAt = new Date(resetCreditExpiresAt);
+    }
+
+    function formatResetCreditExpiry(value) {
+      if (!value) {
+        return "未提供到期時間";
+      }
+      const expiresAt = new Date(value);
       if (Number.isNaN(expiresAt.getTime())) {
-        return resetCreditExpiresAt;
+        return String(value);
       }
       return new Intl.DateTimeFormat("zh-TW", {
         year: "numeric",
@@ -1624,16 +1999,22 @@
       }).format(expiresAt);
     }
 
-    function openResetConfirmation() {
+    function openResetConfirmation(credit) {
       const provider = currentProvider();
-      if (!provider || resetCreditCount === null || resetCreditCount < 1) {
+      if (!provider || resetInFlight || resetCreditCount === null || resetCreditCount < 1
+          || !resetCredits.includes(credit) || Date.parse(credit.expiresAt) <= Date.now()) {
         return;
       }
       pendingResetProviderId = provider.id;
-      pendingResetIdempotencyKey = createResetIdempotencyKey();
-      resetConfirmText.textContent = `確定要為「${provider.name}」使用 1 次用量上限重置嗎？目前可用 ${resetCreditCount} 次。`;
-      resetConfirmExpiresAt.textContent = formatResetCreditExpiry();
-      resetConfirmExpiresAt.title = resetCreditExpiresAt || "";
+      pendingResetCreditId = credit.id;
+      const attemptKey = JSON.stringify([provider.id, credit.id]);
+      if (!resetCreditAttempts.has(attemptKey)) {
+        resetCreditAttempts.set(attemptKey, createResetIdempotencyKey());
+      }
+      pendingResetIdempotencyKey = resetCreditAttempts.get(attemptKey);
+      resetConfirmText.textContent = `確定要為「${provider.name}」使用這張完整重置券嗎？目前可用 ${resetCreditCount} 次。`;
+      resetConfirmExpiresAt.textContent = formatResetCreditExpiry(credit.expiresAt);
+      resetConfirmExpiresAt.title = credit.expiresAt || "";
       resetConfirmMessage.textContent = "";
       resetConfirmSubmit.disabled = false;
       resetConfirmSubmit.textContent = "確認重置";
@@ -1642,6 +2023,7 @@
 
     function clearResetConfirmation() {
       pendingResetProviderId = "";
+      pendingResetCreditId = "";
       pendingResetIdempotencyKey = "";
       resetConfirmMessage.textContent = "";
       resetConfirmSubmit.disabled = false;
@@ -1649,10 +2031,13 @@
     }
 
     async function consumeResetCredit() {
-      if (!pendingResetProviderId || !pendingResetIdempotencyKey) {
+      if (resetInFlight || !pendingResetProviderId || !pendingResetCreditId || !pendingResetIdempotencyKey) {
         return;
       }
       const providerId = pendingResetProviderId;
+      const creditId = pendingResetCreditId;
+      resetInFlight = true;
+      resetConfirmCancel.disabled = true;
       resetConfirmSubmit.disabled = true;
       resetConfirmSubmit.textContent = "重置中...";
       resetConfirmMessage.textContent = "";
@@ -1660,15 +2045,22 @@
         const payload = await apiRequest(`api/provider-configs/${encodeURIComponent(providerId)}/rate-limit-reset`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ idempotencyKey: pendingResetIdempotencyKey })
+          body: JSON.stringify({ idempotencyKey: pendingResetIdempotencyKey, creditId })
         });
         const outcome = String(payload.outcome || "");
+        if (!["reset", "already_redeemed", "no_credit", "nothing_to_reset"].includes(outcome)) {
+          throw new Error("上游回傳未知的重置結果");
+        }
+        resetCreditAttempts.delete(JSON.stringify([providerId, creditId]));
         resetConfirmDialog.close();
         clearResetConfirmation();
 
         const provider = providers.find(item => item.id === providerId);
         if (provider && provider.id === selectedId) {
           await loadResetCreditCount(provider);
+          if (providerId !== selectedId) {
+            return;
+          }
           if (outcome === "reset") {
             resetCreditStatus.textContent = payload.windowsReset > 0
               ? `重置完成，已重置 ${payload.windowsReset} 個用量視窗。`
@@ -1676,7 +2068,7 @@
           } else if (outcome === "already_redeemed") {
             resetCreditStatus.textContent = "此重置請求先前已完成。";
           } else if (outcome === "no_credit") {
-            resetCreditStatus.textContent = "目前沒有可用的重置次數。";
+            resetCreditStatus.textContent = "所選重置券已不可用，請重新選擇。";
           } else {
             resetCreditStatus.textContent = "目前用量尚未達可重置條件。";
           }
@@ -1686,6 +2078,12 @@
         resetConfirmMessage.textContent = `${err.message || "重置失敗"}。可重試本次操作，系統不會重複扣除。`;
         resetConfirmSubmit.disabled = false;
         resetConfirmSubmit.textContent = "重試";
+      } finally {
+        resetInFlight = false;
+        resetConfirmCancel.disabled = false;
+        if (resetCreditCount !== null) {
+          renderResetCredits();
+        }
       }
     }
 
@@ -2079,11 +2477,13 @@
 
     capabilityGrid.addEventListener("change", syncFromForm);
 
-    resetCreditButton.addEventListener("click", openResetConfirmation);
+    billingQuery.addEventListener("click", () => loadBillingTransactions());
+    billingMore.addEventListener("click", () => loadBillingTransactions(true));
+
     resetConfirmSubmit.addEventListener("click", consumeResetCredit);
     resetConfirmCancel.addEventListener("click", () => resetConfirmDialog.close());
     resetConfirmDialog.addEventListener("cancel", event => {
-      if (resetConfirmSubmit.disabled) {
+      if (resetInFlight) {
         event.preventDefault();
       }
     });

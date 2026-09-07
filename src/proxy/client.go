@@ -1484,8 +1484,7 @@ func (_r *streamIdleTimeoutReader) MarkStreamActivity(_eventType string) {
 		return
 	}
 	_eventType = strings.TrimSpace(_eventType)
-	switch strings.ToLower(_eventType) {
-	case "comment", "ping", "heartbeat", "keepalive", "keep-alive":
+	if strings.EqualFold(_eventType, "comment") || IsSSEHeartbeatEvent(_eventType) {
 		return
 	}
 	if _eventType == "" {
@@ -2542,17 +2541,19 @@ func responsePayloadIndicatesFailure(_payload map[string]interface{}, _eventType
 // -------------------------------------------------------------------------------------
 func responseEventPayloads(_event string) []map[string]interface{} {
 	_payloads := []map[string]interface{}{}
-	for _, _line := range strings.Split(_event, "\n") {
-		_line = strings.TrimSpace(_line)
-		if !strings.HasPrefix(_line, "data:") {
-			continue
-		}
-		_payloadText := strings.TrimSpace(strings.TrimPrefix(_line, "data:"))
+	for _, _frame := range ParseSSEDataFrames(_event) {
+		_payloadText := strings.TrimSpace(_frame.Data)
 		if _payloadText == "" || _payloadText == "[DONE]" {
 			continue
 		}
 		var _payload map[string]interface{}
 		if _err := json.Unmarshal([]byte(_payloadText), &_payload); _err == nil {
+			if _payload == nil {
+				continue
+			}
+			if stringFromAny(_payload["type"]) == "" && _frame.Event != "" && _frame.Event != "message" {
+				_payload["type"] = _frame.Event
+			}
 			_payloads = append(_payloads, _payload)
 		}
 	}
@@ -2744,8 +2745,11 @@ func streamEventHasFinishReason(_event string) bool {
 // -------------------------------------------------------------------------------------
 func streamEventMetrics(_event string) ChatMetrics {
 	_metrics := ChatMetrics{}
-	for _, _line := range strings.Split(_event, "\n") {
-		_metrics.merge(streamDataMetrics(_line))
+	for _, _payload := range responseEventPayloads(_event) {
+		_encoded, _err := json.Marshal(_payload)
+		if _err == nil {
+			_metrics.merge(streamDataMetrics("data: " + string(_encoded)))
+		}
 	}
 	return _metrics
 }
@@ -3388,7 +3392,7 @@ func streamResponseParts(_payload map[string]interface{}) streamTextParts {
 		appendTextValue(&_prose, _payload["delta"])
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 		appendTextValue(&_reasoning, _payload["delta"])
-	case "response.function_call_arguments.delta", "response.mcp_call_arguments.delta":
+	case "response.function_call_arguments.delta", "response.mcp_call_arguments.delta", "response.custom_tool_call_input.delta":
 		appendTextValue(&_tool, _payload["delta"])
 	case "response.output_item.added":
 		// 用字尾比對而不是列舉工具型別：function_call、local_shell_call、

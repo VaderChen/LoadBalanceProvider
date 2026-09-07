@@ -30,7 +30,8 @@ type deferredResponseWriter struct {
 	// 它和 committed 是兩回事：保活心跳會 commit（header 必須先送出去），
 	// 但心跳不帶任何回應內容，所以送過心跳之後仍然可以換帳號重試 ——
 	// 客戶端只是多收到幾個會被忽略的 ping。
-	contentWritten bool
+	contentWritten   bool
+	firstCommitEvent string
 	// pendingContent 表示緩衝裡有尚未送出的回應內容。只有在 commit 時才會
 	// 升級成 contentWritten —— 沒送出去的內容不該剝奪重試能力。
 	pendingContent bool
@@ -94,7 +95,17 @@ func (_w *deferredResponseWriter) Write(_data []byte) (int, error) {
 	if _err != nil {
 		return _count, _err
 	}
-	if _w.stream && _w.statusCode < http.StatusBadRequest && (streamBufferHasForwardableEvent(_w.buffer.Bytes()) || _w.buffer.Len() >= deferredResponseBufferLimit) {
+	_reason := ""
+	if _w.stream && _w.statusCode < http.StatusBadRequest {
+		_reason = streamBufferForwardableEvent(_w.buffer.Bytes())
+	}
+	if _w.stream && _w.statusCode < http.StatusBadRequest && (_reason != "" || _w.buffer.Len() >= deferredResponseBufferLimit) {
+		if _w.firstCommitEvent == "" {
+			_w.firstCommitEvent = _reason
+			if _reason == "" {
+				_w.firstCommitEvent = "buffer-limit"
+			}
+		}
 		_w.writeErr = _w.commitLocked()
 		if _w.writeErr != nil {
 			return _count, _w.writeErr
@@ -274,40 +285,161 @@ func flushHTTPResponseWriter(_writer http.ResponseWriter) {
 
 // -------------------------------------------------------------------------------------
 func streamBufferHasForwardableEvent(_data []byte) bool {
+	return streamBufferForwardableEvent(_data) != ""
+}
+
+func streamBufferForwardableEvent(_data []byte) string {
 	// 初始化事件及分段 JSON 留在緩衝，直到完整的有效事件或成功終止事件到達。
 	_text := strings.ReplaceAll(string(_data), "\r\n", "\n")
 	_end := strings.LastIndex(_text, "\n\n")
 	if _end < 0 {
-		return false
+		return ""
 	}
-	for _, _line := range strings.Split(_text[:_end], "\n") {
-		_line = strings.TrimSpace(_line)
-		if !strings.HasPrefix(_line, "data:") {
-			continue
-		}
-		_payloadText := strings.TrimSpace(strings.TrimPrefix(_line, "data:"))
+	for _, _frame := range proxy.ParseSSEDataFrames(_text[:_end+2]) {
+		_payloadText := strings.TrimSpace(_frame.Data)
 		if _payloadText == "" {
 			continue
 		}
 		if _payloadText == "[DONE]" {
-			return true
+			return "done-marker"
 		}
 		var _payload map[string]interface{}
 		if _err := json.Unmarshal([]byte(_payloadText), &_payload); _err != nil {
-			return true
+			return "invalid-json"
 		}
-		switch strings.ToLower(strings.TrimSpace(stringValue(_payload["type"]))) {
-		case "response.created", "response.queued", "response.in_progress", "codex.rate_limits", "codex.response.metadata", "ping", "response.ping", "heartbeat":
+		if _payload == nil {
+			return "non-object-json"
+		}
+		if stringValue(_payload["type"]) == "" && _frame.Event != "" && _frame.Event != "message" {
+			_payload["type"] = _frame.Event
+		}
+		if proxy.IsSSEHeartbeatEvent(stringValue(_payload["type"])) {
 			continue
 		}
+		switch strings.ToLower(strings.TrimSpace(stringValue(_payload["type"]))) {
+		case "response.created", "response.queued", "response.in_progress", "codex.rate_limits", "codex.response.metadata":
+			continue
+		case "response.output_item.added":
+			if streamItemIsEmptyPlaceholder(_payload["item"]) {
+				continue
+			}
+		case "response.content_part.added", "response.reasoning_summary_part.added":
+			if streamPartIsEmptyPlaceholder(_payload["part"]) {
+				continue
+			}
+		}
 		if !streamPayloadIsFailure(_payload) {
-			return true
+			return streamDiagnosticEventType(stringValue(_payload["type"]))
 		}
 	}
-	return false
+	return ""
+}
+
+func (_w *deferredResponseWriter) FirstCommitEvent() string {
+	_w.lock.Lock()
+	defer _w.lock.Unlock()
+	return _w.firstCommitEvent
+}
+
+func streamPartIsEmptyPlaceholder(value interface{}) bool {
+	part, ok := value.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	switch stringValue(part["type"]) {
+	case "output_text", "reasoning_text", "summary_text":
+	default:
+		return false
+	}
+	for key, value := range part {
+		if key == "type" {
+			continue
+		}
+		switch value := value.(type) {
+		case nil:
+		case string:
+			if value != "" {
+				return false
+			}
+		case []interface{}:
+			if len(value) != 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// 保留未知協定事件的識別名稱；限制命名空間、長度與字元，不記錄事件內容。
+func streamDiagnosticEventType(kind string) string {
+	if kind == "" {
+		return "untyped-json"
+	}
+	switch kind {
+	case "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.content_part.done",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.output_text.delta", "response.output_text.done", "response.reasoning_text.delta", "response.reasoning_text.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+		"response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+		"response.completed", "response.incomplete", "response.refusal.delta":
+		return kind
+	default:
+		if len(kind) <= 96 {
+			valid := true
+			for _, ch := range kind {
+				if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') && ch != '.' && ch != '_' && ch != '-' {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				return kind
+			}
+		}
+		return "other-event"
+	}
 }
 
 // -------------------------------------------------------------------------------------
+// 只延後已知的空殼事件；參數、內容、完成事件及未知工具一律維持原轉送邊界。
+func streamItemIsEmptyPlaceholder(value interface{}) bool {
+	item, ok := value.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	switch stringValue(item["type"]) {
+	case "message", "reasoning", "function_call", "custom_tool_call":
+	default:
+		return false
+	}
+	if status := stringValue(item["status"]); status != "" && status != "in_progress" {
+		return false
+	}
+	for key, value := range item {
+		switch key {
+		case "id", "type", "status", "role", "name", "call_id":
+			continue
+		}
+		switch value := value.(type) {
+		case nil:
+		case string:
+			if value != "" {
+				return false
+			}
+		case []interface{}:
+			if len(value) != 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func streamPayloadIsFailure(_payload map[string]interface{}) bool {
 	_type := strings.ToLower(strings.TrimSpace(stringValue(_payload["type"])))
 	if _type == "error" || strings.HasSuffix(_type, ".failed") {

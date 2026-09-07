@@ -1,268 +1,134 @@
 # Load Balance Provider
 
-**繁體中文** | [English](README.en.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+**繁體中文** | [English（舊版概覽）](README.en.md) | [日本語（舊版概覽）](README.ja.md) | [한국어（舊版概覽）](README.ko.md)
 
-`LoadBalanceProvider` 是一個 LLM Proxy 服務。服務提供 OpenAI Chat Completions 與 Responses 相容 API，並依照請求內容大小、工作量、工作性質與 Provider 即時負載，選擇合適的後端 LLM Provider 處理。
+集中管理多個 LLM Provider，讓相容的應用程式、Codex 與 Agent 共用單一服務入口。透過 Web 管理介面查看負載、用量與帳號狀態，並依模型能力及可用容量安排請求。
 
-## 功能目標
+## 功能特色
 
-- **OpenAI 相容入口**：支援 `POST /v1/chat/completions` 與 `POST /v1/responses`，保留既有 OpenAI SDK 或相容 Client 的接入方式。
-- **長任務 Prompt Cache 黏著**：以 `previous_response_id` 或 `prompt_cache_key` 將同一段 Responses 對話導回原 Provider/Model，避免多輪工具呼叫與加密推理內容因切換帳號而失效。
-- **多 Provider 管理**：透過 `data/llm_proxy.json` 登錄多個 OpenAI-compatible Provider、模型能力、權重、成本與併發上限。
-- **智慧路由**：依照輸入 token 估算、輸出需求、訊息數、任務類型與模型能力進行分數式選擇。
-- **一般與串流支援**：非 streaming 以一般 HTTP response 轉回，`stream=true` 時維持 SSE/Chunked 轉送。
-- **負載平衡**：以 provider 權重、模型品質、成本、目前 active request 與 max concurrent 做通用評分。
-- **請求密度與輸出結構監看**：依 API 金鑰統計近期請求頻率、Token 消耗、模型等級、輸入／輸出比、正文比例與推理比例，協助辨識大量低輸出請求或高階模型使用不當的帳號。
-- **標準 MCP**：提供 MCP `2025-11-25` Streamable HTTP 端點，將金鑰管理以外的查詢與操作公開為工具。
+| 功能 | 使用價值 |
+| --- | --- |
+| 統一 API 入口 | 支援 OpenAI 相容 Chat Completions、Responses 與串流回應，方便既有工具接入。 |
+| 多 Provider 與模型管理 | 集中設定來源、模型能力、併發上限與選擇策略，支援自動選擇或指定來源。 |
+| 對話來源固定 | 選定後保留原 Provider 與模型，工具接續及重試不因短暫過載任意切換帳號。 |
+| 暫時故障重試 | 尚未輸出有效內容時，保持下游連線並在原來源等待重試；優先遵守上游建議的等待時間。 |
+| 服務統計 | 查看啟用來源、活躍請求、綁定數、反應時間與 Token 速度，支援工作階段及累計檢視。 |
+| 用量與帳號管理 | 查看剩餘量、每日用量及每金鑰使用情形；ChatGPT／Codex OAuth 來源另提供重設與帳單功能。 |
+| MCP 整合 | 讓支援 MCP 的工具查詢服務狀態或執行允許的操作，並可切換唯讀模式。 |
+| 更新與恢復 | 部署 ZIP 支援管理頁面更新，保存可恢復的對話配對；另提供 DMG／MSI 桌面安裝方式。 |
 
-## 目錄結構
+## 管理介面
 
-- `src/cmd/loadbalanceprovider/main.go`：服務進入點，初始化服務框架、HTTP API 與 LLM Proxy 元件。
-- `src/service/cloud_service.go`：服務生命週期與背景 Provider 狀態記錄。
-- `src/api/http_api.go`：REST API 路由，包含 `/v1/chat/completions`、`/v1/responses`、`/api/health`、`/api/providers`。
-- `src/api/mcp.go`：標準 MCP Streamable HTTP、JSON-RPC 生命週期、工具目錄與既有 API 轉接。
-- `src/domain/types.go`：Chat Completion、Provider、Model、錯誤格式等共用型別。
-- `src/config/provider_config.go`：讀取 `data/llm_proxy.json` 的 LLM Proxy 設定並套用預設值。
-- `src/analyzer/request_analyzer.go`：估算請求大小、輸出工作量、任務類型與複雜度。
-- `src/balancer/load_balancer.go`：候選 Provider/Model 過濾、評分與即時負載統計。
-- `src/keyusage/recorder.go`：API 金鑰每月用量，以及最近一小時的請求密度與 Token 消耗統計。
-- `src/telemetry/request.go`：從 Chat／Responses 請求抽取工具呼叫、工具輪次、工具輸出量、續接與重複任務訊號。
-- `src/proxy/client.go`：OpenAI-compatible Chat Completion HTTP 轉發與串流代理。
-- `agent.properties`：服務基本設定。
-- `data/llm_proxy.json`：LLM Provider、模型能力與負載平衡設定。
+### Provider 與模型
 
-## API
+新增來源後，設定連線、認證、模型與最大併發數，再啟用供請求使用。連線設定可收合，方便在較窄的畫面檢視其他帳號資訊。
 
-### 儀表板快照
+自動選擇預設從合格來源中隨機挑選，也保留加權評分策略。選擇時會考慮模型支援、容量與可用狀態；已建立綁定的對話則優先維持原來源。Codex OAuth 的模型清單可向上游重新查詢，實際可用項目以帳號權限及查詢結果為準。
 
-管理頁面使用 `GET /api/dashboard`，僅供 Web 管理登入存取。首屏回傳必要的 Provider 資訊、記憶體中的執行狀態與剩餘量快照，不等待 OAuth 更新或歷史檔案掃描，也不傳送完整模型 catalog、金鑰欄位及 Provider 編輯設定。
+### 服務統計與用量
 
-帳號資訊以一次本地批次讀取取得，不觸發 token 更新；統計基準與歷史累計由同一服務實例共用的背景工作補齊，每次更新完成後快取 60 秒，多個使用者不會各自啟動重複工作。OAuth 更新與上游用量查詢沿用既有背景刷新及實際請求流程。歷史掃描採獨立鎖，不在掃描期間持有請求紀錄寫入鎖。
+- 儀表板採緊湊排列，顯示 Provider 總數、啟用數、活躍請求與可使用量。
+- 平均速度區列出反應時間、處理時間、Token 生成與輸出速度。
+- 活躍模型區可查看各 Provider 的請求、綁定及併發情形。
+- 用量暫時查不到時，保留已有的有效觀測；包含舊值時會標示，不把缺值當作滿額或零額。
+- 每日用量採有效觀測計算；舊版紀錄可能保留量測偏差，畫面會提示，並不宣稱歷史資料已自動修復。
 
-回應包含 `updatedAt`、`historyUpdatedAt`、`accountsUpdatedAt`、`refreshing`、`historyReady`、`accountsReady`、`baselinesReady` 與 `refreshError`。前端先顯示快照，背景更新期間逐步補取；未就緒的累計統計、基準相關指標或缺少的配額顯示待更新狀態。只有統計與基準就緒後才允許歸零。歸零成功會立即更新後端基準快取。
+剩餘量是帳號配額觀測，不等於實際費用。即時比例、每日配額消耗與 Token 統計的口徑不同，不宜直接互相換算。
 
-一般刷新及 TAB 快取為 60 秒，背景補取／失敗重試採 1、2、4 秒逐步增加至最多 30 秒的間隔。離開儀表板或瀏覽器分頁隱藏時暫停補取，更新失敗保留已有畫面；頁面顯示快照及歷史統計的更新時間。每日用量圖表仍在開啟對話框時才讀取。
+### 使用量限制重設
+
+ChatGPT／Codex OAuth 來源可展開「使用量限制重設」卡片，查看可用次數及各張重設的到期時間，由使用者選擇要使用哪一張並確認。只有上游確認重設成功後，才更新對應用量狀態。
+
+可用重設與資格依上游帳號回傳為準；沒有可用項目不代表查詢失敗，也不會自動購買或使用重設。
+
+### 帳單列表
+
+ChatGPT／Codex OAuth 來源的重設卡片下方提供可收合的「帳單列表」：
+
+1. 預設不查詢、不顯示帳單資料。
+2. 按右側「查詢」後顯示載入狀態。
+3. 結果依新到舊列出日期、金額、付款狀態與下載按鈕，可繼續載入較早紀錄。
+4. 「下載」開啟該筆帳單的 Stripe 頁面，再由該頁下載帳單或收據。
+
+帳單僅供管理頁面登入查詢，不向一般 API 金鑰或 MCP 公開。查詢使用該 Provider 的 OAuth 認證；是否可取得資料仍取決於帳號權限與上游服務。帳單連結含私人存取資訊，請勿公開分享。
+
+### 金鑰與即時監看
+
+依 API 金鑰查看請求密度、Token 消耗、使用模型等級、正文與推理比例，協助調整資源配置。可選擇觀察時間與顯示欄位。
+
+選用的「低推理降級」功能預設關閉，可對符合條件的高頻低推理用量限制候選模型品質等級；不覆寫明確指定模型或強制來源。若無合適候選，仍可能選用較高等級模型以維持可用性。近期監看樣本在重啟後重新累積，月次統計另行保存。
+
+## 對話連續性與故障處理
+
+- **先選定，再固定**：一個請求選定 Provider 後，重試使用相同來源與模型。
+- **工具接續沿用原來源**：依呼叫端提供的對話識別恢復配對，降低跨帳號接續造成的問題。
+- **心跳不是內容**：等待時維持下游連線，初始化與保活事件不會提前讓請求失去重試機會。
+- **有限等待**：過載優先遵守 `Retry-After`；未提供時遞增退避並加入隨機偏移，等待及重試均有上限。
+- **內容送出後不重播**：文字或工具參數已轉送時，不把另一次回應接上原串流，也不以成功訊息掩蓋失敗。
+- **保存與恢復配對**：重新啟動可讀取持久化綁定，透過「系統更新」升級前另保存路由快照。
+
+若用戶端未提供明確的提問回合識別，系統會保守固定整段對話，不保證每個新問題都重新分配 Provider。綁定遺失時，只有不依賴舊回應參照且歷史完整的請求才可能重新配對恢復問答；缺少的前文不能憑空重建。
+
+這些功能不能消除上游過載、模型內部錯誤或網路斷線。更新也不能保存進行中的 TCP／SSE 連線；請在較少請求時更新，讓用戶端在重啟後重新連線。
+
+詳見 [連線與重試](RETRY_POLICY.md) 與 [對話配對與更新恢復](TURN_BINDING.md)。
+
+## 接入方式
+
+將相容工具的 Base URL 設為 `https://<你的服務位址>/v1`，使用管理介面核發的 API 金鑰。以下為格式範例，模型與功能仍以所選來源支援為準。
 
 ### Chat Completions
 
 ```http
 POST /v1/chat/completions
-Content-Type: application/json
 Authorization: Bearer <client-token>
+Content-Type: application/json
+
+{"model":"AUTO","messages":[{"role":"user","content":"請整理這份文件"}],"stream":false}
 ```
 
-請求格式維持 OpenAI Chat Completions 相容。服務會解析 `model`、`messages`、`stream`、`max_tokens` 或 `max_completion_tokens`，選擇後端模型後轉發。
-
-```json
-{
-  "model": "auto",
-  "messages": [
-    {"role": "user", "content": "請幫我規劃一個高可用架構"}
-  ],
-  "stream": false
-}
-```
-
-### Responses API
+### Responses
 
 ```http
 POST /v1/responses
-Content-Type: application/json
 Authorization: Bearer <client-token>
-```
-
-請求格式維持 OpenAI Responses API 相容，支援一般回應與 `stream=true` 的 SSE 串流轉送。`model` 可指定實際模型或使用 `AUTO`，由服務依 Provider 能力與即時負載選擇後端。
-
-```json
-{
-  "model": "AUTO",
-  "input": "請分析此專案並提出重構計畫",
-  "stream": true,
-  "prompt_cache_key": "project-refactor-2026"
-}
-```
-
-Responses API 亦支援既有 response 的查詢、刪除、取消、輸入項目與 input token 計算等相容子路由；服務會將請求轉送至建立該 response 的 Provider，並以呼叫端 API Key 隔離路由資料。
-
-#### 串流連線與故障恢復
-
-- 上游尚未送出有效內容時，服務暫存初始化事件與待轉送請求；遇到可重試故障可重新選擇 Provider，期間維持同一條下游連線並傳送心跳。失敗嘗試的初始化事件不會混入成功回應。
-- 一旦文字或工具呼叫已轉送至下游，就不再切換 Provider 或重播該請求，避免重複執行。Responses 串流失敗使用 `response.failed` 結束並帶出原因，不將失敗偽裝成成功完成。
-- 請求格式、上下文長度與政策拒絕等請求本身的錯誤不會觸發容量冷卻；模型不存在或明確的模型過載只冷卻該 Provider 的該模型，帳號配額與限流則冷卻整個 Provider。有效的 `Retry-After` 優先於預設冷卻秒數，同一個有效冷卻窗口不會因並發失敗持續延長。
-- 候選 Provider 都在容量冷卻且可在剩餘等待預算內恢復時，串流請求會保持連線等待再選路由。每個請求累計冷卻等待上限為 `30` 秒，不因切換 Provider 重設；此上限不包含上游執行時間，實際請求重試仍受 `retry_count` 限制。
-- Codex OAuth 依 Provider 身分合併並發 token 刷新；遇到 HTTP `401` 時，OAuth 請求最多刷新並重送一次。若其他請求已完成刷新，直接使用新 token；API key 認證不套用 OAuth 刷新。
-- Responses 完成事件若缺少 `output` 或項目 ID，會以同一串流已收到的 `response.output_item.done` 完整項目補齊，不覆蓋既有內容，也不以未完成的 delta 組合工具參數。
-
-這些處理可降低上游暫時故障造成的重新連線，但無法保證跨反向代理、用戶端或網路中斷後仍維持連線。等待回應標頭與串流無進展逾時由 Provider 的 `timeout_seconds` 控制；上游純心跳不會延長無進展期限。部署時亦需確認反向代理未緩衝 SSE，詳見 [部署手冊](DEPLOY.md#串流連線與反向代理)。
-
-#### 長任務 Prompt Cache 黏著
-
-Responses 長任務通常包含多輪推理、工具呼叫或加密 reasoning 內容，過程中若切換 Provider 或帳號，上游可能無法識別先前狀態。服務會自動建立對話黏著關係：
-
-1. 回應建立成功後，記錄 response ID、`prompt_cache_key`、Provider、Model 與呼叫端身分的對應。
-2. 後續請求帶有 `previous_response_id` 時，優先導回原 Provider/Model。
-3. Codex 等 Client 未送出 `previous_response_id`、但沿用相同 `prompt_cache_key` 時，仍會導回原 Provider/Model，適合長時間 Agent 任務與多輪工具呼叫。
-4. 黏著資料依 API Key 隔離，不同呼叫端無法共用其他使用者的 response 或 Prompt Cache 路由。
-5. Provider 不可用、配額顯著低於其他 Provider、黏著逾時或路由被淘汰時，服務會移除無法跨 Provider 使用的 `previous_response_id` 與加密 reasoning，再重新執行負載平衡，避免整個任務直接失敗。
-
-管理介面的「設定 > 進階」可調整以下參數：
-
-- **對話黏著 TTL**：預設 `30` 分鐘，可設定 `1` 至 `10080` 分鐘；長任務應依最長步驟間隔適度提高。
-- **黏著配額容忍值**：預設 `10` 個百分點；原 Provider 配額低於同儕平均超過此值時，允許解除黏著並重新選擇。
-- **Response 路由上限**：預設 `2000` 筆，可設定 `100` 至 `100000` 筆；超過上限時會淘汰較舊的路由。
-
-#### 每金鑰低推理降級
-
-「設定 > 進階 > 低推理降級」可在整體 Provider 配額開始消耗後，暫時限制高頻、低推理 API 金鑰可選模型的品質等級。功能預設關閉，設定保存在 `data/advanced_settings.json`。
-
-- 啟動閘門採所有啟用且有觀測資料的 Provider 當日配額消耗平均值，預設達 `18%` 才開始評估；這不是單一 API 金鑰的當日用量。門檻設為 `0` 可停用閘門，尚無配額資料時不會啟動。
-- 每支 API 金鑰使用最近 `15` 分鐘的滾動窗口。預設須同時滿足 `≥8 req/min`、推理 Token 佔實際輸出 `<10%`，且至少有 `5` 筆上游確實回報推理量的完成樣本。
-- 符合條件後，預設將模型品質等級上限設為 `4`、維持 `10` 分鐘；到期後解除並重新觀察。設定變更或服務重啟會清除記憶體中的降級狀態。
-- 降級目前是候選模型的品質上限，不會改寫呼叫端明確指定的模型或金鑰強制路由。若沒有符合上限的候選，負載平衡器會 fail-open 選用較高等級模型，避免回傳無可用 Provider。
-
-若要讓同一個長任務穩定命中既有 Prompt Cache，Client 應在整段任務期間持續使用相同的 `prompt_cache_key`，不同任務則使用不同且穩定的識別值。
-
-### 健康檢查
-
-```http
-GET /api/health
-GET /api/providers
-```
-
-### 請求密度監看
-
-管理介面的「即時監看」頁面會依 API 金鑰顯示近期使用情形，包括總請求、每分鐘請求、完成請求的 Token 總數、每請求平均 Token、實際使用模型的平均品質等級、輸出比、正文比、推理比，以及低／中／高輸出與需求複雜度分布。API 另提供工具呼叫、工具輪次、工具輸出量、續接比例與重複任務比例，供後續異常偵測及模型降級策略使用。頁面每 `60` 秒背景更新；觀察視窗、帳號狀態與顯示欄位會保存在目前瀏覽器。
-
-```http
-GET /api/api-keys/density?window=15m
-```
-
-- `window` 接受秒數或 Go duration，例如 `60`、`5m`、`1h`；預設 `5m`，上限 `1h`。
-- **輸出比**為實際完成輸出 Token ÷ 估算輸入 Token。輸出 Token 包含上游回報的正文、推理與工具呼叫參數；輸入量未知的完成請求不列入輸出比分級。預設 `≤2%` 為低輸出、`>2%` 且 `≤20%` 為中輸出、`>20%` 為高輸出；管理員可在「設定 > 進階 > 輸出比分級門檻」調整兩個分界，儲存後即時監看會立即套用。
-- 介面的輸出比主值採用逐筆比值的中位數 `output_ratio_median`，避免單一超大 Context 主導結果；副值「總和」為視窗內總輸出 Token ÷ 總估算輸入 Token，即 `output_ratio`。
-- **正文比**為可辨識的使用者可見文字估算 Token ÷ 該請求實際完成輸出 Token。介面主值使用逐筆中位數 `prose_ratio_median`，副值使用總和比例 `prose_ratio`。只有能從回應事件或輸出項目拆出用途的完成請求才納入，讀取端必須同時檢查 `prose_samples`；沒有樣本不等於正文比為 `0%`。
-- **推理比** `reasoning_ratio` 為上游回報的推理 Token `reasoning_tokens` ÷ 實際完成輸出 Token。推理 Token 已包含在完成輸出量內，此欄位是輸出結構的拆分，不可再次加到總輸出 Token。
-- 模型等級是完成請求實際使用模型之 `quality_tier` 加權平均；將高模型等級與極低輸出比並列，可協助找出以高階模型重複執行低輸出工作的帳號。
-- 工具行為只保留可直接驗證的聚合數據：`tool_call_count`、`tool_calls_per_request`、`tool_round_count`、`tool_rounds_per_request` 與 `tool_output_tokens`。舊版 `os_tool_ratio`、`tool_type_counts` 與 OS 工具分類已移除，不應再由名稱推測工具用途。
-- 重複任務以最後一筆 User 文字正規化後的 SHA-256 指紋判斷；不保存原始提示詞。輸出比分級維持純粹的 Token 比例，不會因工具操作而改變，降級策略應組合輸出結構、模型等級、工具輪次、續接與重複任務等多項指標判斷。
-- 複雜度分數 `1–3` 為低需求、`4–6` 為中需求、`7–10` 為高需求；無有效分數時歸入低需求。
-- 請求頻率在請求完成分類後記錄；Token 消耗只統計已完成並取得實際用量的請求，因此兩者母體可能不同。
-- 最近一小時的逐筆樣本與任務指紋只保存在記憶體，服務重新啟動後會重新累積；每月請求與活動彙總仍會連同既有統計保存在 `usage/<key>/YYYY-MM.json`。
-- 回應會列出無流量、停用及視窗內已刪除的金鑰，但只提供名稱與聚合數據，不回傳 Key ID、前綴或遮罩金鑰。
-- 此端點僅供 Web 管理登入使用；一般 API 金鑰與 MCP 金鑰不能存取。
-
-## MCP
-
-服務提供單一 Streamable HTTP 端點：
-
-```text
-http://<host>:<port>/mcp/
-```
-
-MCP 預設啟用，協定版本為 `2025-11-25`，支援 `initialize`、`notifications/initialized`、`ping`、`tools/list` 與 `tools/call`。端點不維持伺服器主動 SSE，因此 `GET /mcp/` 依規格回傳 `405 Method Not Allowed`；每個 JSON-RPC 訊息使用獨立的 HTTP `POST`。
-
-連線可使用管理介面「金鑰管理」核發的 API 金鑰或 MCP 專用金鑰驗證：
-
-```http
-POST /mcp/ HTTP/1.1
-Authorization: Bearer <api-key>
 Content-Type: application/json
-Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example","version":"1.0.0"}}}
+{"model":"AUTO","input":"請分析這個專案","stream":true,"prompt_cache_key":"project-session"}
 ```
 
-API Key 可呼叫一般 REST API 與 MCP；Web 登入暫時金鑰不能呼叫 MCP。MCP 金鑰只能呼叫 MCP，不能呼叫 Chat、Responses 或其他一般 REST API，亦不收集累計或每月使用統計。
+同一任務保持穩定的對話識別。以 `previous_response_id` 接續時，仍須使用保存該回應的原來源。另支援回應查詢、取消、刪除及輸入項目等相容子路由。
 
-管理介面的「設定 > MCP」可調整：
+### MCP
 
-- 啟用或停用 MCP。
-- 唯讀模式；開啟時，`tools/list` 只提供不改變狀態的查詢工具。
-- 額外允許的瀏覽器 Origin；未帶 `Origin` 的原生 MCP Client 與同源瀏覽器請求不需加入清單。
-- 檢視實際端點、協定版本與目前公開工具。
+端點為 `http://<host>:<port>/mcp/`。可在「設定 > MCP」查看工具清單、開關、唯讀模式與允許的瀏覽器來源。
 
-工具以既有 REST handler 為唯一執行來源，涵蓋服務狀態、模型、Provider、儀表板與用量、一般／進階／通知／MCP 設定、基準測試、系統監控、系統更新、Chat Completions、Responses 與多模態代理。API Key 的列出、核發、修改、啟停、刪除、路由綁定與用量查詢固定不會透過 MCP 公開。
+API 金鑰可供一般 API 與 MCP 使用；MCP 專用金鑰僅限 MCP；Web 管理登入不作為 MCP 認證。金鑰管理與帳單等受限操作不透過 MCP 公開。對外開放前，請先確認所核發金鑰允許的操作範圍。
 
-## Provider 設定
+### Codex 設定整合
 
-Provider 以 `data/llm_proxy.json` 的 `providers` 設定。`enabled` 預設範例為 `false`，正式使用前需改為 `true` 並設定對應 API key 環境變數。
-Provider 與通知目標 URL 只允許 `http`/`https`，並阻擋 link-local、unspecified、multicast 等位址；private CIDR 與 localhost/loopback 暫時允許供內網模型服務使用。
+既有設定工具可合併 Provider、模型目錄及相關功能至 `config.toml`，保留專案信任與不相關的個人設定，並提供恢復原來源的方式。部署 ZIP 不包含這些設定腳本。
 
-Codex OAuth 的模型清單由上游動態取得，上游會依 `client_version` 決定可見模型。管理介面的模型查詢預設宣告 Codex `0.153.0`；日後可在服務啟動環境設定 `MARS_CODEX_MODELS_CLIENT_VERSION` 為已確認可用的新版 Codex 版本，重新啟動服務後重新整理模型清單。查詢的 `Version` 與預設 `User-Agent` 會同步使用此版本；若 Codex 呼叫端已提供 `client_version` 或 `Version`，仍優先保留呼叫端版本。實際可用模型由該 Provider 的 OAuth 帳號及上游回應決定。
+套用或還原後，請完整重新啟動 Codex App、CLI 或 VS Code Extension Host。設定方式與既有環境變數名稱請見 [安裝說明](install.md#codex-app-用戶端設定)。
 
-```json
-{
-  "id": "primary-openai-compatible",
-  "base_url": "https://api.openai.com",
-  "api_key_env": "OPENAI_API_KEY",
-  "chat_completions_path": "/v1/chat/completions",
-  "enabled": true,
-  "weight": 10,
-  "max_concurrent": 32,
-  "models": [
-    {
-      "name": "gpt-4.1-mini",
-      "aliases": ["auto", "balanced"],
-      "max_input_tokens": 1040000,
-      "max_output_tokens": 32768,
-      "capabilities": ["chat", "reasoning", "coding"],
-      "cost_tier": 2,
-      "quality_tier": 7
-    }
-  ]
-}
-```
+## 安裝與建置
 
-## 選擇策略
-
-目前預設採 `random`：
-
-1. 先排除停用、未設定 `base_url`、超過 `max_concurrent`、token 容量不足的候選。
-2. 將候選交給策略層處理，目前 `random` 會從合格 Provider/Model 中隨機挑選。
-3. 策略層會產生 selection meta，回應 Header 會帶出 `X-Proxy-Strategy`、`X-Proxy-Provider`、`X-Proxy-Model` 等資訊。
-4. 保留 `weighted_score` 策略實作，後續可加入成本、延遲、能力分類、健康度等策略。
-5. Responses 後續請求若命中 `previous_response_id` 或 `prompt_cache_key` 黏著路由，會優先使用原 Provider/Model；僅在路由失效、Provider 不可用或配額差距超過容忍值時才降級回一般負載平衡。
-
-## Codex 設定整合
-
-設定整合功能可協助管理模型來源、Provider、模型目錄及相關擴充功能。實際支援項目會依執行環境、部署方式與可用權限而有所不同。
-
-設定變更會以增量方式合併至既有的 `config.toml`，並保留專案信任資訊、功能旗標及其他不相關設定。套用前會保存必要狀態，以便需要時還原原先的 Provider、Profile 與模型選擇。
-
-以下為設定整合的格式範例；實際的服務位址、驗證資訊與檔案路徑會依部署環境調整：
-
-```toml
-# BEGIN Mars LLM Proxy managed settings
-model = "AUTO"
-model_catalog_json = "<codex-home>/mars-model-catalog.json"
-model_provider = "mars-llm-proxy"
-# END Mars LLM Proxy managed settings
-
-[model_providers.mars-llm-proxy]
-name = "LoadBalanceProvider"
-base_url = "https://proxy.example.com/v1"
-env_key = "MARS_API_KEY"
-wire_api = "responses"
-requires_openai_auth = true
-
-[features]
-image_generation = true
-
-[mcp_servers.mars-llm-proxy]
-url = "https://proxy.example.com/mcp/"
-bearer_token_env_var = "MARS_API_KEY"
-enabled_tools = ["image_gen"]
-tool_timeout_sec = 600
-```
-
-完成套用、還原或更新後，請完整重新啟動 Codex App、CLI 或 VS Code Extension Host，使新的設定與帳號狀態重新載入。
-
-## 本地開發
+| 平台／方式 | 說明 |
+| --- | --- |
+| macOS DMG | 將 App 拖到應用程式後啟動，再用瀏覽器管理；正式發布使用簽章且公證的版本。 |
+| Windows MSI | 安裝後由開始功能表啟動；正式發布僅使用已驗證簽章的版本。 |
+| Linux ARM64／x86_64 ZIP | 解壓縮後執行安裝／啟動腳本；Linux 發行檔不要求程式簽章。 |
+| 原始碼 | 使用 Go 1.25.6 或相容的新版本建置。 |
 
 ```bash
-go mod tidy
-go test ./...
-go run ./src/cmd/loadbalanceprovider
+go mod download
+go build -buildvcs=false ./...
+go run -buildvcs=false ./src/cmd/loadbalanceprovider
 ```
 
-語法檢查通過後即可啟動。若未啟用任何 Provider，`/v1/chat/completions` 與 `/v1/responses` 會回傳 `service_unavailable`。
+首次啟動後依環境設定 HTTP／HTTPS 與 Provider 認證。未設定可用來源時，推論請求無法完成。正式環境請使用 HTTPS 並保護管理入口與資料目錄。
+
+- [安裝說明](install.md)：安裝、啟動、資料位置與升級。
+- [部署手冊](DEPLOY.md)：建置環境、封裝方式、反向代理及必要設定。
+- [連線與重試](RETRY_POLICY.md)：等待、重試與錯誤處理。
+- [對話配對與更新恢復](TURN_BINDING.md)：配對規則、更新保存與恢復限制。

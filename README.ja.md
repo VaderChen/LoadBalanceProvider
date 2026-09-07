@@ -1,5 +1,7 @@
 # Load Balance Provider
 
+> 版本提醒：本頁為舊版翻譯，尚未同步最新功能。請以 [繁體中文文件](README.md)、[連線與重試](RETRY_POLICY.md) 及 [對話配對與更新恢復](TURN_BINDING.md) 為準。下文關於故障或配額差距可解除黏著、刪除前文後換來源的舊行為已不適用；目前選定後維持原 Provider。新的帳單、自選重設與更新保存功能亦請參閱繁體中文文件。
+
 [繁體中文](README.md) | [English](README.en.md) | **日本語** | [한국어](README.ko.md)
 
 `LoadBalanceProvider` は LLM プロキシサービスです。OpenAI 互換の Chat Completions API と Responses API を提供し、リクエストサイズ、処理負荷、タスク特性、Provider のリアルタイム負荷に基づいて、適切なバックエンド LLM Provider を選択します。

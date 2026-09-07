@@ -17,8 +17,8 @@ func TestLayeredCooldownSmoke(t *testing.T) {
 	runtime.MarkModelUnavailable("gpt-test", time.Millisecond, time.Minute)
 	until := runtime.ModelUnavailableUntil("gpt-test")
 	runtime.MarkModelUnavailable("gpt-test", time.Millisecond, time.Hour)
-	if !runtime.ModelUnavailableUntil("gpt-test").Equal(until) {
-		t.Fatal("concurrent failure extended cooldown")
+	if !runtime.ModelUnavailableUntil("gpt-test").After(until) {
+		t.Fatal("longer model cooldown was ignored")
 	}
 	_, _, _, _, err := b.Select(&domain.ChatCompletionRequest{Model: "gpt-test"})
 	var unavailable *NoAvailableProviderError
@@ -31,8 +31,12 @@ func TestLayeredCooldownSmoke(t *testing.T) {
 	runtime.MarkTemporaryUnavailable(time.Millisecond, time.Minute)
 	accountUntil := atomic.LoadInt64(&runtime.CapacityUnavailableUntil)
 	runtime.MarkTemporaryUnavailable(time.Millisecond, time.Hour)
+	if atomic.LoadInt64(&runtime.CapacityUnavailableUntil) <= accountUntil {
+		t.Fatal("longer account cooldown was ignored")
+	}
+	accountUntil = atomic.LoadInt64(&runtime.CapacityUnavailableUntil)
 	runtime.MarkSuccessWithMetrics(time.Millisecond, 1, 0, 0, 0)
 	if atomic.LoadInt64(&runtime.CapacityUnavailableUntil) != accountUntil {
-		t.Fatal("in-flight success/failure changed account cooldown")
+		t.Fatal("in-flight success cleared account cooldown")
 	}
 }

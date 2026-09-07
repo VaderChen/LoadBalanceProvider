@@ -1,5 +1,7 @@
 # LoadBalanceProvider 安裝說明
 
+功能介紹請見 [README](README.md)。Linux ARM64／x86_64 使用 ZIP，無須程式簽章；macOS／Windows 正式安裝檔僅使用已驗證簽章的版本，macOS 另需完成公證。下載後可使用同版本 SHA-256 檢查碼確認完整性，檢查碼不等同簽章。
+
 ## DMG／MSI 安裝版
 
 安裝包是既有 Web 管理服務的桌面啟動方式，不另建原生管理視窗，也不自動註冊開機服務。
@@ -24,7 +26,7 @@
 
 ## 封裝內容
 
-部署 zip 內會包含三個平台的執行檔：
+`build.sh` 的通用部署 ZIP 內會包含三個平台的執行檔；Linux 分架構發行 ZIP 則只需包含對應執行檔及必要資源：
 
 - `bin/LoadBalanceProvider_mac_arm64`：macOS Apple Silicon。
 - `bin/LoadBalanceProvider_linux_x64`：Linux x86_64 / amd64。
@@ -105,6 +107,16 @@ agent.sample.properties -> agent.properties
 - Linux arm64 / aarch64
 
 其他平台會停止並顯示不支援訊息。若要支援其他架構，需要在 `build.sh` 增加對應的 `GOOS/GOARCH` 編譯目標，並同步更新 `install.sh` 的平台判斷。
+
+## 更新與資料保留
+
+更新前備份 `agent.properties`、`data/`、`usage/` 及自訂認證資料位置，並選擇較少請求的時段。
+
+- 部署 ZIP：可用管理頁面「系統更新」，支援版本會先保存配對紀錄再重新啟動；更新套件不覆蓋 `data/`。
+- DMG／MSI：停止服務後使用新版安裝包升級，保留原使用者資料目錄；不支援 ZIP 自我更新。
+- 手動搬移或重新部署：保留原 Provider 識別與完整設定資料，不能只複製執行檔後期待舊對話自動恢復。
+
+重啟後可恢復仍有效的配對，但原有串流需要用戶端重連。從不支援更新前保存的舊版本首次升級時，無法補回已遺失的紀錄。詳見 [對話配對與更新恢復](TURN_BINDING.md)。
 
 ## Codex App 用戶端設定
 
