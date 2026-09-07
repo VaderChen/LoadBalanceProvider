@@ -10,6 +10,26 @@ import (
 
 const providerCooldownWaitBudget = 30 * time.Second
 
+func cooldownWaitReason(ctx context.Context, err error, budget time.Duration, ready bool) string {
+	if ctx.Err() != nil {
+		return "canceled"
+	}
+	if ready {
+		return "ready"
+	}
+	var unavailable *balancer.NoAvailableProviderError
+	if !errors.As(err, &unavailable) || !unavailable.TemporaryOverload || unavailable.RetryAfter <= 0 {
+		return "not_temporarily_available"
+	}
+	if budget <= 0 {
+		return "wait_budget_exhausted"
+	}
+	if unavailable.RetryAfter > budget {
+		return "cooldown_exceeds_budget"
+	}
+	return "downstream_write_failed"
+}
+
 // 等待消耗獨立的累計預算，不因換 Provider 重設，也不計作一次實際上游請求。
 func waitForProviderCooldown(ctx context.Context, writer *deferredResponseWriter, heartbeat []byte, selectionErr error, budget time.Duration) (time.Duration, bool) {
 	if ctx.Err() != nil {

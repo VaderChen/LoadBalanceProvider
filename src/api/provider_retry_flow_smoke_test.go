@@ -8,12 +8,39 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"LoadBalanceProvider/src/balancer"
 	"LoadBalanceProvider/src/config"
 	"LoadBalanceProvider/src/domain"
 	"LoadBalanceProvider/src/proxy"
 )
+
+func TestAdmissionWaitDoesNotConsumeFailureBackoff(t *testing.T) {
+	cfg := &domain.ProxyConfig{RetryCount: 1, Providers: []domain.LLMProviderConfig{{
+		ID: "only", Name: "only", Kind: "openai", Type: "openai", Enabled: true,
+		BaseURL: "https://8.8.8.8", MaxConcurrent: 4,
+		Models: []domain.LLMModelConfig{{Name: "smoke", MaxInputTokens: 100000, MaxOutputTokens: 8192, Capabilities: []string{"chat", "responses"}}},
+	}}}
+	var calls atomic.Int32
+	client := proxy.NewClient()
+	client.HTTPClient = &http.Client{Transport: failoverSmokeTransport(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return &http.Response{StatusCode: 500, Header: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"1"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"server_error","message":"internal server error"}}`))}, nil
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_recovered\",\"status\":\"completed\",\"output\":[]}}\n\n"))}, nil
+	})}
+	h := &HTTPAPI{Client: client, Balancer: balancer.NewLoadBalancer(cfg), AdvancedSettingsConfigPath: filepath.Join(t.TempDir(), "advanced.json")}
+	settings := config.DefaultAdvancedSettingsConfig()
+	settings.ProviderRetryWaitSeconds = 1
+	h.cacheAdvancedSettings(settings)
+	h.Balancer.Providers[0].MarkTemporaryUnavailable(0, 600*time.Millisecond)
+	w := httptest.NewRecorder()
+	h.handleResponsesProxy(w, httptest.NewRequest(http.MethodPost, "/v1/responses", nil), []byte(`{"model":"smoke","stream":true,"input":"hello"}`))
+	if calls.Load() != 2 || !strings.Contains(w.Body.String(), "resp_recovered") {
+		t.Fatalf("initial queue consumed retry backoff: calls=%d body=%s", calls.Load(), w.Body.String())
+	}
+}
 
 func TestProviderRetryFlowSmoke(t *testing.T) {
 	for _, tc := range []struct {

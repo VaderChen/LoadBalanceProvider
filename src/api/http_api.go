@@ -61,6 +61,7 @@ const (
 
 // -------------------------------------------------------------------------------------
 type HTTPAPI struct {
+	reconnectBudgets   reconnectBudgetStore
 	updateRouteRestore sync.Once
 	turnGateLock       sync.Mutex
 	turnGates          map[string]*turnGate
@@ -3048,6 +3049,7 @@ func (_h *HTTPAPI) handleChatCompletions(_w http.ResponseWriter, _r *http.Reques
 
 // -------------------------------------------------------------------------------------
 func (_h *HTTPAPI) handleResponsesProxy(_w http.ResponseWriter, _r *http.Request, _body []byte) {
+	_r = withReconnectIdentity(_r, _body)
 	if _h.Balancer == nil || _h.Client == nil {
 		_h.writeJSON(_w, http.StatusServiceUnavailable, domain.ErrorResponse("service_unavailable", "proxy service is not initialized"))
 		return
@@ -3395,6 +3397,28 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	if _pinnedProvider && _maxRetries > pinnedProviderMaxRetries {
 		_maxRetries = pinnedProviderMaxRetries
 	}
+	_reconnectKey, _ := _r.Context().Value(reconnectIdentityKey{}).(string)
+	_shared, _rejection := _h.reconnectBudgets.acquire(_reconnectKey, _maxRetries+1)
+	if _rejection != nil {
+		if _rejection.retryAfter > 0 {
+			_w.Header().Set("Retry-After", strconv.Itoa(_rejection.retryAfter))
+		}
+		log.Printf("provider replay blocked: trace=%s reason=%s", _trace, _rejection.code)
+		_h.writeJSON(_w, _rejection.status, domain.ErrorResponse(_rejection.code, _rejection.message))
+		return
+	}
+	_success := false
+	defer func() { _h.reconnectBudgets.release(_reconnectKey, _shared, _success) }()
+	if _shared != nil {
+		_maxRetries = _shared.limit - _shared.attempts - 1
+		if _shared.provider != "" {
+			if (_request.ProviderID != "" && _request.ProviderID != _shared.provider) || (_request.Provider != "" && _request.Provider != _shared.provider) {
+				_h.writeJSON(_w, http.StatusBadRequest, domain.ErrorResponse("request_route_conflict", "重連請求與原 Provider 不一致，未送往上游"))
+				return
+			}
+			_request.ProviderID, _request.Provider, _request.Model = _shared.provider, _shared.provider, _shared.model
+		}
+	}
 	_h.applyLowReasoningDemotion(_r, &_request)
 	_h.refreshConversationBindings()
 
@@ -3404,6 +3428,13 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	var _lastErr error
 	var _lastDeferred *deferredResponseWriter
 	_waitedForCooldown := time.Duration(0)
+	_waitedForAdmission := time.Duration(0)
+	_hasDispatched := false
+	if _shared != nil {
+		_waitedForCooldown = _shared.waited
+		_waitedForAdmission = _shared.admissionWaited
+		_hasDispatched = _shared.attempts > 0
+	}
 	_retrySettings := _h.currentAdvancedSettings()
 	_budget := providerRetryBudget{maxRounds: _retrySettings.ProviderRetryRounds, maxSources: _retrySettings.ProviderRetrySourcesPerRound}
 
@@ -3420,8 +3451,19 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 				if _headersSent {
 					_waitWriter.AdoptCommitted()
 				}
-				_elapsed, _ready := waitForProviderCooldown(_r.Context(), _waitWriter, _waitHeartbeat, _err, time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second-_waitedForCooldown)
-				_waitedForCooldown += _elapsed
+				// 首次排隊不可吃掉失敗後的退避額度；兩者均跨重連累計，不逐次重設。
+				_waitPhase := "retry"
+				_spent := &_waitedForCooldown
+				if !_hasDispatched {
+					_waitPhase, _spent = "admission", &_waitedForAdmission
+				}
+				_remaining := time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second - *_spent
+				_elapsed, _ready := waitForProviderCooldown(_r.Context(), _waitWriter, _waitHeartbeat, _err, _remaining)
+				*_spent += _elapsed
+				if _shared != nil {
+					_shared.waited, _shared.admissionWaited = _waitedForCooldown, _waitedForAdmission
+				}
+				log.Printf("provider wait result: trace=%s phase=%s remaining=%s elapsed=%s ready=%t reason=%s", _trace, _waitPhase, _remaining, _elapsed, _ready, cooldownWaitReason(_r.Context(), _err, _remaining, _ready))
 				_headersSent = _headersSent || _waitWriter.Committed()
 				if _lastDeferred == nil {
 					_lastDeferred = _waitWriter
@@ -3479,6 +3521,12 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_request.ProviderID = _target.Config.ID
 		_request.Provider = _target.Config.ID
 		_request.Model = _model.Name
+		_hasDispatched = true
+		if _shared != nil {
+			_shared.provider, _shared.model = _target.Config.ID, _model.Name
+			_shared.attempts++
+			log.Printf("provider replay budget: trace=%s attempt=%d limit=%d waited=%s", _trace, _shared.attempts, _shared.limit, _shared.waited)
+		}
 		_pinnedProvider = true
 		_attemptStarted := time.Now()
 		_budget.used = append(_budget.used, _target.Config.ID)
@@ -3499,6 +3547,9 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_metrics, _forwardErr := _forward(_ctx, _deferred, _target, _model, _profile, _selectionMeta)
 		_stopKeepalive()
 		_cancel()
+		if _shared != nil && _deferred.ContentWritten() {
+			_shared.delivered = true
+		}
 		proxy.EnrichFailure(_forwardErr, _deferred.BufferedBody())
 		if _deferred.Committed() {
 			_headersSent = true
@@ -3512,7 +3563,11 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		if _forwardErr == nil {
 			if _commitErr := _deferred.Commit(); _commitErr != nil {
 				_forwardErr = _commitErr
+				if _shared != nil && _deferred.ContentWritten() {
+					_shared.delivered = true
+				}
 			} else {
+				_success = true
 				if _metrics.FirstResponseMS > 0 {
 					_metrics.FirstResponseMS += float64(_attemptStarted.Sub(_started).Milliseconds())
 				}
@@ -3537,6 +3592,13 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_lastDeferred = _deferred
 		_failurePolicy := proxy.ClassifyFailure(_forwardErr)
 		if _deferred.ContentWritten() || _attempt >= _maxRetries || !providerFailureCanRetryBeforeFirstToken(_forwardErr, _deferred) {
+			_reason := "not_retryable"
+			if _deferred.ContentWritten() {
+				_reason = "content_delivered"
+			} else if _attempt >= _maxRetries {
+				_reason = "attempt_limit"
+			}
+			log.Printf("provider retry stopped: trace=%s reason=%s admission_waited=%s retry_waited=%s", _trace, _reason, _waitedForAdmission, _waitedForCooldown)
 			if _deferred.ContentWritten() {
 				return
 			}
