@@ -23,6 +23,10 @@ func prepareRecoveryBody(body []byte, requireHistory bool) ([]byte, error) {
 	if requireHistory && strings.TrimSpace(previous) != "" {
 		return nil, fmt.Errorf("這個請求只有增量前文，請用完整歷史重送或開啟新對話")
 	}
+	var text string
+	if json.Unmarshal(payload["input"], &text) == nil && strings.TrimSpace(text) != "" {
+		return body, nil
+	}
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(payload["input"], &items); err != nil {
 		return nil, fmt.Errorf("恢復問答需要完整訊息歷史")

@@ -118,6 +118,11 @@ func (h *HTTPAPI) saveTurnRoutes(routes map[string]proxy.ResponseRouteTarget) er
 		}
 		entries[key] = savedTurnBinding{Provider: target.ProviderID, Model: target.Model, Fingerprint: fingerprint, Until: time.Now().Add(30 * 24 * time.Hour)}
 	}
+	return h.writeTurnBindings(entries)
+}
+
+// 呼叫端持有 turnBindingFileLock。
+func (h *HTTPAPI) writeTurnBindings(entries map[string]savedTurnBinding) error {
 	// 不淘汰仍有效的綁定來容納新回合，以免既有工具流程失去來源。
 	if len(entries) > 10000 {
 		return fmt.Errorf("持久化回合綁定已達容量上限")

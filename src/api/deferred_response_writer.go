@@ -16,16 +16,19 @@ import (
 // -------------------------------------------------------------------------------------
 const deferredResponseBufferLimit = 2 * 1024 * 1024
 
+var errResponseBufferLimit = errors.New("回應暫存超過 2 MiB 安全上限，未送出部分內容；請縮小單次輸出")
+
 // -------------------------------------------------------------------------------------
 type deferredResponseWriter struct {
 	// lock 保護所有狀態：保活心跳由另一個 goroutine 送出，與轉發同時進行。
-	lock       sync.Mutex
-	target     http.ResponseWriter
-	header     http.Header
-	statusCode int
-	buffer     bytes.Buffer
-	stream     bool
-	committed  bool
+	lock              sync.Mutex
+	target            http.ResponseWriter
+	header            http.Header
+	statusCode        int
+	buffer            bytes.Buffer
+	stream            bool
+	deferUntilSuccess bool
+	committed         bool
 	// contentWritten 表示「真正的回應內容」已經**送達客戶端**（不是只寫進緩衝）。
 	// 它和 committed 是兩回事：保活心跳會 commit（header 必須先送出去），
 	// 但心跳不帶任何回應內容，所以送過心跳之後仍然可以換帳號重試 ——
@@ -41,6 +44,13 @@ type deferredResponseWriter struct {
 // -------------------------------------------------------------------------------------
 func newDeferredResponseWriter(_target http.ResponseWriter, _stream bool) *deferredResponseWriter {
 	return &deferredResponseWriter{target: _target, header: make(http.Header), stream: _stream}
+}
+
+// 由支援的來源啟用，所有 SSE 內容待轉送流程確認成功後才由 Commit 送出。
+func (_w *deferredResponseWriter) DeferStreamUntilSuccess() {
+	_w.lock.Lock()
+	defer _w.lock.Unlock()
+	_w.deferUntilSuccess = _w.stream
 }
 
 // -------------------------------------------------------------------------------------
@@ -88,12 +98,19 @@ func (_w *deferredResponseWriter) Write(_data []byte) (int, error) {
 		return _w.target.Write(_data)
 	}
 	_w.pendingContent = true
+	if _w.deferUntilSuccess && len(_data) > deferredResponseBufferLimit-_w.buffer.Len() {
+		_w.writeErr = errResponseBufferLimit
+		return 0, _w.writeErr
+	}
 	if _w.statusCode == 0 {
 		_w.statusCode = http.StatusOK
 	}
 	_count, _err := _w.buffer.Write(_data)
 	if _err != nil {
 		return _count, _err
+	}
+	if _w.deferUntilSuccess {
+		return _count, nil
 	}
 	_reason := ""
 	if _w.stream && _w.statusCode < http.StatusBadRequest {
@@ -179,6 +196,11 @@ func (_w *deferredResponseWriter) commitLocked() error {
 	if _w == nil {
 		return nil
 	}
+	if _w.deferUntilSuccess && _w.pendingContent {
+		if err := validateBufferedResponse(_w.buffer.String()); err != nil {
+			return err
+		}
+	}
 	defer _w.boundWriteLocked()()
 	if !_w.committed {
 		for _name, _values := range _w.header {
@@ -195,6 +217,9 @@ func (_w *deferredResponseWriter) commitLocked() error {
 		_w.committed = true
 	}
 	if _w.pendingContent {
+		if _w.deferUntilSuccess && _w.firstCommitEvent == "" {
+			_w.firstCommitEvent = "validated-response"
+		}
 		// 內容真的離開緩衝送給客戶端了，這一刻起才沒有退路。
 		_w.contentWritten = true
 	}
@@ -203,6 +228,38 @@ func (_w *deferredResponseWriter) commitLocked() error {
 	}
 	flushHTTPResponseWriter(_w.target)
 	return _w.writeErr
+}
+
+func validateBufferedResponse(body string) error {
+	completed := false
+	for _, frame := range proxy.ParseSSEDataFrames(body) {
+		if strings.TrimSpace(frame.Data) == "[DONE]" {
+			continue
+		}
+		var payload map[string]interface{}
+		if json.Unmarshal([]byte(frame.Data), &payload) != nil || payload == nil {
+			return &proxy.ProviderStreamError{Message: "provider returned invalid buffered SSE", TruncatedStream: true}
+		}
+		kind := stringValue(payload["type"])
+		if kind == "" {
+			kind = frame.Event
+			payload["type"] = kind
+		}
+		if streamPayloadIsFailure(payload) || kind == "response.incomplete" || kind == "response.cancelled" {
+			return &proxy.ProviderStreamError{Message: "provider buffered response did not complete successfully", TruncatedStream: true}
+		}
+		if kind == "response.completed" {
+			response, ok := payload["response"].(map[string]interface{})
+			if !ok || (stringValue(response["status"]) != "" && stringValue(response["status"]) != "completed") || response["error"] != nil {
+				return &proxy.ProviderStreamError{Message: "provider returned invalid response completion", TruncatedStream: true}
+			}
+			completed = true
+		}
+	}
+	if !completed {
+		return &proxy.ProviderStreamError{Message: "provider stream ended without response.completed", TruncatedStream: true}
+	}
+	return nil
 }
 
 // -------------------------------------------------------------------------------------
@@ -217,6 +274,7 @@ func (_w *deferredResponseWriter) ResetForGracefulTerminal() bool {
 		return false
 	}
 	_w.buffer.Reset()
+	_w.deferUntilSuccess = false
 	_w.pendingContent = false
 	_w.statusCode = 0
 	_w.header = make(http.Header)

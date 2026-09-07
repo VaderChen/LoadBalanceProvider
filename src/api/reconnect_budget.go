@@ -14,6 +14,7 @@ import (
 )
 
 const reconnectRetention = 10 * time.Minute
+const reconnectRetryCooldown = 30 * time.Second
 const reconnectEntryLimit = 10000
 
 type reconnectIdentityKey struct{}
@@ -48,11 +49,14 @@ type reconnectBudgetStore struct {
 type reconnectBudget struct {
 	active          bool
 	expires         time.Time
+	retryAt         time.Time
 	attempts        int
 	limit           int
 	waited          time.Duration
 	admissionWaited time.Duration
 	provider, model string
+	rebindFrom      string
+	usedProviders   []string
 	delivered       bool
 }
 
@@ -84,7 +88,17 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 		}
 		entry.limit = min(entry.limit, limit)
 		if entry.attempts >= entry.limit {
-			return nil, &reconnectRejection{http.StatusBadRequest, 0, "request_retry_exhausted", "此請求已達跨重連重試上限，暫停重送 10 分鐘；請稍後再試或提出新的請求"}
+			if entry.retryAt.IsZero() {
+				entry.retryAt = now.Add(reconnectRetryCooldown)
+			}
+			if now.Before(entry.retryAt) {
+				seconds := int((entry.retryAt.Sub(now) + time.Second - 1) / time.Second)
+				return nil, &reconnectRejection{http.StatusTooManyRequests, seconds, "request_retry_exhausted", fmt.Sprintf("代理上游嘗試額度（%d 次）已用盡，與用戶端重連次數分開計算；請在 %d 秒後重試，上游較長的冷卻仍須等待", entry.limit, seconds)}
+			}
+			// 冷卻後只增加一次探測機會，不重新發放整套內部重試額度。
+			entry.attempts = entry.limit - 1
+			entry.waited, entry.admissionWaited = 0, 0
+			entry.retryAt = time.Time{}
 		}
 	} else {
 		if len(s.entries) >= reconnectEntryLimit {
@@ -112,4 +126,7 @@ func (s *reconnectBudgetStore) release(key string, entry *reconnectBudget, succe
 	}
 	entry.active = false
 	entry.expires = time.Now().Add(reconnectRetention)
+	if entry.attempts >= entry.limit && !entry.delivered {
+		entry.retryAt = time.Now().Add(reconnectRetryCooldown)
+	}
 }

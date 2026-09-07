@@ -71,6 +71,9 @@ type ProviderRuntime struct {
 	TotalCompletionTokens    int64
 	_usageLock               sync.Mutex
 	Usage                    ProviderUsageSnapshot
+	usageHeaderFallback      ProviderUsageSnapshot
+	accountUsageAt           time.Time
+	accountUsageUntil        time.Time
 	LastUsageProbeAt         int64
 	AuthError                ProviderAuthErrorState
 }
@@ -1156,20 +1159,37 @@ func (_p *ProviderRuntime) RecordUsageHeaders(_headers http.Header) {
 		return
 	}
 	_snapshot := buildProviderUsageSnapshot(_values)
+	_p.recordUsageSnapshot(_snapshot, 0)
+}
+
+func (_p *ProviderRuntime) recordUsageSnapshot(_snapshot ProviderUsageSnapshot, _accountMaxAge time.Duration) bool {
 	_remaining, _known := _snapshot.KnownRemainingPercent()
 	if !_known {
-		return
+		return false
 	}
 	_p._usageLock.Lock()
+	if _accountMaxAge > 0 {
+		_p.accountUsageAt = _snapshot.UpdatedAt
+		_p.accountUsageUntil = _snapshot.UpdatedAt.Add(_accountMaxAge)
+		_p.usageHeaderFallback = ProviderUsageSnapshot{}
+	} else {
+		if !_snapshot.UpdatedAt.Before(_p.usageHeaderFallback.UpdatedAt) && _snapshot.coversUsage(_p.usageHeaderFallback) {
+			_p.usageHeaderFallback = _snapshot
+		}
+		if time.Now().Before(_p.accountUsageUntil) || _snapshot.UpdatedAt.Before(_p.Usage.UpdatedAt) {
+			_p._usageLock.Unlock()
+			return false
+		}
+	}
 	// 不用不完整的新快照取代完整的舊快照，避免統計在不同額度窗口間跳動。
-	if !_snapshot.coversUsage(_p.Usage) {
+	if _accountMaxAge <= 0 && !_snapshot.coversUsage(_p.Usage) {
 		_p._usageLock.Unlock()
-		return
+		return false
 	}
 	_p.Usage = _snapshot
 	_p._usageLock.Unlock()
 	if _p.Config == nil || !_snapshot.HasUsageInfo() {
-		return
+		return true
 	}
 	if _err := providerusage.DefaultRecorder().Record(
 		_p.Config.ID,
@@ -1179,6 +1199,7 @@ func (_p *ProviderRuntime) RecordUsageHeaders(_headers http.Header) {
 	); _err != nil {
 		log.Printf("provider usage history record failed: provider=%s error=%v", _p.Config.ID, _err)
 	}
+	return true
 }
 
 // -------------------------------------------------------------------------------------
@@ -1325,7 +1346,11 @@ func (_p *ProviderRuntime) UsageStale(_now time.Time, _maxAge time.Duration) boo
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) ShouldProbeUsage(_now time.Time, _maxAge time.Duration) bool {
-	if _p == nil || _p.HasAuthError() || !_p.UsageStale(_now, _maxAge) {
+	return _p != nil && _p.UsageStale(_now, _maxAge) && _p.ShouldProbeAccountUsage(_now, _maxAge)
+}
+
+func (_p *ProviderRuntime) ShouldProbeAccountUsage(_now time.Time, _maxAge time.Duration) bool {
+	if _p == nil || _p.HasAuthError() {
 		return false
 	}
 	_lastProbe := atomic.LoadInt64(&_p.LastUsageProbeAt)
@@ -1733,7 +1758,11 @@ func (_p *ProviderRuntime) copyRuntimeState(_old *ProviderRuntime) {
 	_p.LastCompletionTokens = _lastCompletionTokens
 	_p.ClientDeliveryEWMA, _p.LastClientDeliveryTPS = _old.ClientDeliverySnapshot()
 	_p.ProviderReportedTPSEWMA, _p.LastProviderReportedTPS = _old.ProviderReportedTPSSnapshot()
-	_p.Usage = _old.UsageSnapshot()
+	_old._usageLock.Lock()
+	_p.Usage = cloneProviderUsageSnapshot(_old.Usage)
+	_p.usageHeaderFallback = cloneProviderUsageSnapshot(_old.usageHeaderFallback)
+	_p.accountUsageAt, _p.accountUsageUntil = _old.accountUsageAt, _old.accountUsageUntil
+	_old._usageLock.Unlock()
 	_p.AuthError = _old.AuthErrorSnapshot()
 	atomic.StoreInt64(&_p.LastUsageProbeAt, atomic.LoadInt64(&_old.LastUsageProbeAt))
 	atomic.StoreInt64(&_p.TotalCompletionTokens, atomic.LoadInt64(&_old.TotalCompletionTokens))

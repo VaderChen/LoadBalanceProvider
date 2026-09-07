@@ -100,11 +100,14 @@ func (_c *Client) refreshProviderUsageForProvider(_ctx context.Context, _provide
 	_ctx, _cancel := context.WithTimeout(_ctx, 45*time.Second)
 	defer _cancel()
 
+	if isOpenAICodexProvider(_provider) && strings.TrimSpace(providerAPIKey(_provider)) == "" {
+		if !_force && !_provider.ShouldProbeAccountUsage(time.Now(), providerUsageStaleThreshold) {
+			return nil
+		}
+		return _c.refreshOpenAICodexOAuthUsage(_ctx, _provider)
+	}
 	if !_force && !_provider.ShouldProbeUsage(time.Now(), providerUsageStaleThreshold) {
 		return nil
-	}
-	if isOpenAICodexProvider(_provider) && strings.TrimSpace(providerAPIKey(_provider)) == "" {
-		return _c.refreshOpenAICodexOAuthUsage(_ctx, _provider)
 	}
 	return _c.refreshGenericProviderUsageByMinimalRequest(_ctx, _provider)
 }
@@ -223,7 +226,7 @@ func (_c *Client) TestProviderMinimalChat(_ctx context.Context, _provider *balan
 	defer _cancel()
 
 	if isOpenAICodexProvider(_provider) && strings.TrimSpace(providerAPIKey(_provider)) == "" {
-		return _c.refreshOpenAICodexOAuthUsage(_ctx, _provider)
+		return _c.testOpenAICodexMinimalChat(_ctx, _provider)
 	}
 	return _c.refreshGenericProviderUsageByMinimalRequest(_ctx, _provider)
 }
@@ -243,7 +246,7 @@ func providerShouldRefreshUsage(_provider *balancer.ProviderRuntime) bool {
 }
 
 // -------------------------------------------------------------------------------------
-func (_c *Client) refreshOpenAICodexOAuthUsage(_ctx context.Context, _provider *balancer.ProviderRuntime) error {
+func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *balancer.ProviderRuntime) error {
 	_model := providerUsageProbeModelName(_provider.Config)
 	if _model == "" {
 		return fmt.Errorf("provider has no model for codex usage refresh")

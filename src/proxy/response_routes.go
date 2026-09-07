@@ -69,9 +69,11 @@ func (_c *Client) RecordPromptCacheRoute(_routeID string, _providerID string, _m
 		Owner:      strings.TrimSpace(_owner),
 		CreatedAt:  _now,
 	}
+	_c.responseRouteMutationLock.Lock()
 	if _, _loaded := _c.ResponseRoutes.Swap(_routeID, _target); !_loaded {
 		atomic.AddInt64(&_c.responseRouteCount, 1)
 	}
+	_c.responseRouteMutationLock.Unlock()
 	if atomic.LoadInt64(&_c.responseRouteCount) > int64(_c.responseRouteMaxEntriesValue()) {
 		_c.pruneResponseRoutes(_now, true)
 	}
@@ -142,9 +144,11 @@ func (_c *Client) RecordResponseSnapshotForOwner(_responseID string, _providerID
 	if _next.CreatedAt.IsZero() {
 		_next.CreatedAt = _now
 	}
+	_c.responseRouteMutationLock.Lock()
 	if _, _loaded := _c.ResponseRoutes.Swap(_responseID, _next); !_loaded {
 		atomic.AddInt64(&_c.responseRouteCount, 1)
 	}
+	_c.responseRouteMutationLock.Unlock()
 	if atomic.LoadInt64(&_c.responseRouteCount) > int64(_c.responseRouteMaxEntriesValue()) {
 		_c.pruneResponseRoutes(_now, true)
 	}
@@ -247,6 +251,8 @@ func (_c *Client) DeleteResponseRoute(_responseID string) {
 }
 
 func (_c *Client) deleteResponseRoute(_responseID string) {
+	_c.responseRouteMutationLock.Lock()
+	defer _c.responseRouteMutationLock.Unlock()
 	if _, _loaded := _c.ResponseRoutes.LoadAndDelete(strings.TrimSpace(_responseID)); _loaded {
 		atomic.AddInt64(&_c.responseRouteCount, -1)
 	}

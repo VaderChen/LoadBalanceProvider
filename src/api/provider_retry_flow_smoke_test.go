@@ -50,7 +50,7 @@ func TestProviderRetryFlowSmoke(t *testing.T) {
 		wantCalls    int
 	}{
 		{"round-limit", 0, false, 1},
-		{"no-failover-when-wait-disabled", 1, false, 1},
+		{"capacity-failover-without-wait", 1, false, 2},
 		{"no-replay-after-content", 2, true, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

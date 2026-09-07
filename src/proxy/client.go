@@ -16,6 +16,7 @@ import (
 	"net/textproto"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,13 +30,14 @@ import (
 
 // -------------------------------------------------------------------------------------
 type Client struct {
-	HTTPClient               *http.Client
-	ResponseRoutes           sync.Map
-	responseRouteCount       int64
-	responseRouteLastSweepAt int64
-	responseRouteTTLNanos    atomic.Int64
-	responseRouteMaxEntries  atomic.Int64
-	usageRefreshRunning      atomic.Bool
+	HTTPClient                *http.Client
+	ResponseRoutes            sync.Map
+	responseRouteMutationLock sync.Mutex
+	responseRouteCount        int64
+	responseRouteLastSweepAt  int64
+	responseRouteTTLNanos     atomic.Int64
+	responseRouteMaxEntries   atomic.Int64
+	usageRefreshRunning       atomic.Bool
 }
 
 const (
@@ -163,6 +165,8 @@ type streamResult struct {
 // compatibility fallback; Responses streams must terminate with an error event.
 type streamFailureTerminal func(error) []byte
 
+var activeProviderStreams atomic.Int64
+
 // streamIdleTimeoutReader expires only when no complete SSE event arrives.
 // Active long-running streams are not constrained by a total request deadline.
 type streamIdleTimeoutReader struct {
@@ -173,6 +177,8 @@ type streamIdleTimeoutReader struct {
 	timedOut      atomic.Bool
 	done          chan struct{}
 	stopOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 // -------------------------------------------------------------------------------------
@@ -365,6 +371,11 @@ func (_c *Client) ForwardMultimodal(_ctx context.Context, _w http.ResponseWriter
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) ForwardResponses(_ctx context.Context, _w http.ResponseWriter, _srcReq *http.Request, _provider *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _rawBody []byte, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (ChatMetrics, error) {
+	if isOpenAICodexProvider(_provider) {
+		if writer, ok := _w.(interface{ DeferStreamUntilSuccess() }); ok {
+			writer.DeferStreamUntilSuccess()
+		}
+	}
 	return _c.ForwardResponsesRoute(_ctx, _w, _srcReq, _provider, _model, ResponsesProxyRoute{Method: http.MethodPost, Path: "/v1/responses"}, _rawBody, _profile, _selectionMeta)
 }
 
@@ -1371,7 +1382,12 @@ func streamCopy(_w http.ResponseWriter, _reader io.Reader, _started time.Time, _
 // -------------------------------------------------------------------------------------
 func streamCopyWithProviderIdleTimeout(_w http.ResponseWriter, _reader io.ReadCloser, _started time.Time, _forwardUsage bool, _recordResponseID func(string, map[string]interface{}), _provider *balancer.ProviderRuntime, _heartbeatBody []byte, _refusalTerminal func(string) []byte, _failureTerminal streamFailureTerminal) (ChatMetrics, error) {
 	_idleReader := newStreamIdleTimeoutReader(_reader, providerStreamIdleTimeout(_provider))
-	defer _idleReader.Stop()
+	_providerID := providerIDForLog(_provider)
+	log.Printf("provider stream opened: provider=%s active_streams=%d goroutines=%d", _providerID, activeProviderStreams.Add(1), runtime.NumGoroutine())
+	defer func() {
+		_ = _idleReader.Close()
+		log.Printf("provider stream closed: provider=%s active_streams=%d goroutines=%d", _providerID, activeProviderStreams.Add(-1), runtime.NumGoroutine())
+	}()
 	_metrics, _err := streamCopyWithResponseRecorder(_w, _idleReader, _started, _forwardUsage, _recordResponseID, _heartbeatBody, _refusalTerminal, _failureTerminal)
 
 	_providerName := "unknown"
@@ -1425,7 +1441,7 @@ func streamCopyWithProviderIdleTimeout(_w http.ResponseWriter, _reader io.ReadCl
 		)
 		_err = &ProviderStreamError{
 			Message:           "provider stream closed before sending a terminal event",
-			ResponseForwarded: _metrics.ClientContentItems > 0,
+			ResponseForwarded: responseWriterContentWritten(_w, _metrics.ClientContentItems > 0),
 			TruncatedStream:   true,
 		}
 	}
@@ -1533,7 +1549,8 @@ func (_r *streamIdleTimeoutReader) Close() error {
 	if _r.reader == nil {
 		return nil
 	}
-	return _r.reader.Close()
+	_r.closeOnce.Do(func() { _r.closeErr = _r.reader.Close() })
+	return _r.closeErr
 }
 
 // -------------------------------------------------------------------------------------
@@ -1555,7 +1572,7 @@ func (_r *streamIdleTimeoutReader) watch() {
 				continue
 			}
 			_r.timedOut.Store(true)
-			_ = _r.reader.Close()
+			_ = _r.Close()
 			return
 		}
 	}
@@ -1629,7 +1646,7 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 			_body := _completionRepair.process(_event.Body)
 			_responseSnapshot.consumeEvent(_body)
 			_failureState.observe(_body)
-			_delivered := _writerMetrics.ClientContentItems > 0 || responseWriterContentWritten(_w)
+			_delivered := responseWriterContentWritten(_w, _writerMetrics.ClientContentItems > 0)
 			if _event.TerminalError != "" && _refusalTerminal != nil && !_delivered &&
 				(_event.RetryableCapacity || providerErrorTextIsAuthentication(_event.TerminalError) ||
 					providerErrorTextIsRetryableUpstreamFailure(_event.TerminalError)) {
@@ -1678,7 +1695,7 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 			}
 			flushResponse(_w)
 			_resetHeartbeat()
-			if _event.HasContent {
+			if _event.HasContent && responseWriterContentWritten(_w, true) {
 				_writerMetrics.recordClientContentWrite(time.Since(_started))
 			}
 			if streamEventIsTerminalMarker(_event.Body) {
@@ -1711,7 +1728,7 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 	_metrics.TerminalSeen = _terminalSeen || _resultValue.DoneSeen
 	if _resultValue.Err != nil {
 		if _failureTerminal != nil && !errors.Is(_resultValue.Err, context.Canceled) &&
-			(_writerMetrics.ClientContentItems > 0 || responseWriterContentWritten(_w)) {
+			responseWriterContentWritten(_w, _writerMetrics.ClientContentItems > 0) {
 			if _, _writeErr := _w.Write(_failureTerminal(_resultValue.Err)); _writeErr != nil {
 				return _metrics, _writeErr
 			}
@@ -1726,7 +1743,7 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 	}
 	if !_resultValue.DoneSeen {
 		if _failureTerminal != nil {
-			if _writerMetrics.ClientContentItems == 0 && !responseWriterContentWritten(_w) {
+			if !responseWriterContentWritten(_w, _writerMetrics.ClientContentItems > 0) {
 				return _metrics, errResponsesStreamMissingTerminal
 			}
 			if _, _writeErr := _w.Write(_failureTerminal(errResponsesStreamMissingTerminal)); _writeErr != nil {
@@ -1748,9 +1765,12 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 }
 
 // -------------------------------------------------------------------------------------
-func responseWriterContentWritten(_w http.ResponseWriter) bool {
+func responseWriterContentWritten(_w http.ResponseWriter, fallback ...bool) bool {
 	_writer, _ok := _w.(interface{ ContentWritten() bool })
-	return _ok && _writer.ContentWritten()
+	if _ok {
+		return _writer.ContentWritten()
+	}
+	return len(fallback) > 0 && fallback[0]
 }
 
 // -------------------------------------------------------------------------------------

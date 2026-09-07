@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
+
+type turnGateHeadersKey struct{}
 
 type turnBindingError struct {
 	message string
@@ -105,7 +108,7 @@ type turnGate struct {
 }
 
 // 同一回合先取得閘門再選來源；等待可隨請求取消，離開後回收閘門。
-func (h *HTTPAPI) acquireTurnGate(key string, r *http.Request) (func(), error) {
+func (h *HTTPAPI) acquireTurnGate(key string, r *http.Request, heartbeat ...func() error) (func(), error) {
 	if key == "" {
 		return func() {}, nil
 	}
@@ -128,12 +131,25 @@ func (h *HTTPAPI) acquireTurnGate(key string, r *http.Request) (func(), error) {
 		}
 		h.turnGateLock.Unlock()
 	}
-	select {
-	case gate.token <- struct{}{}:
-		var once sync.Once
-		return func() { once.Do(func() { <-gate.token; drop() }) }, nil
-	case <-r.Context().Done():
-		drop()
-		return nil, r.Context().Err()
+	var ticks <-chan time.Time
+	if len(heartbeat) > 0 && heartbeat[0] != nil {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+	for {
+		select {
+		case gate.token <- struct{}{}:
+			var once sync.Once
+			return func() { once.Do(func() { <-gate.token; drop() }) }, nil
+		case <-r.Context().Done():
+			drop()
+			return nil, r.Context().Err()
+		case <-ticks:
+			if err := heartbeat[0](); err != nil {
+				drop()
+				return nil, err
+			}
+		}
 	}
 }

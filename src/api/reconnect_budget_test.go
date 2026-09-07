@@ -56,6 +56,20 @@ func TestReconnectBudgetAcrossAttempts(t *testing.T) {
 	if _, rejection = store.acquire("a", 3); rejection == nil || rejection.code != "request_retry_exhausted" {
 		t.Fatal("exhausted replay accepted")
 	}
+	deadline := e.retryAt
+	if _, rejection = store.acquire("a", 3); rejection == nil || e.retryAt != deadline || rejection.retryAfter <= 0 {
+		t.Fatal("blocked reconnect extended cooldown or omitted remaining wait")
+	}
+	e.retryAt = time.Now().Add(-time.Second)
+	probe, rejection := store.acquire("a", 3)
+	if rejection != nil || probe.limit-probe.attempts != 1 || probe.provider != "p" || probe.model != "m" || probe.waited != 0 {
+		t.Fatal("cooldown did not admit exactly one same-provider probe")
+	}
+	probe.attempts++
+	store.release("a", probe, false)
+	if _, rejection = store.acquire("a", 3); rejection == nil {
+		t.Fatal("failed recovery probe did not reapply cooldown")
+	}
 	e.expires = time.Now().Add(-time.Second)
 	fresh, rejection := store.acquire("a", 3)
 	if rejection != nil || fresh.attempts != 0 {

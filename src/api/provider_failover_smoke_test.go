@@ -19,7 +19,7 @@ type failoverSmokeTransport func(*http.Request) (*http.Response, error)
 
 func (f failoverSmokeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestSameProviderRetryKeepsDownstreamSmoke(t *testing.T) {
+func TestCapacityFailoverKeepsDownstreamSmoke(t *testing.T) {
 	for _, mode := range []string{"recover", "exhausted", "tool_started"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := &domain.ProxyConfig{RetryCount: 1}
@@ -105,7 +105,7 @@ func TestSameProviderRetryKeepsDownstreamSmoke(t *testing.T) {
 					t.Fatalf("tool request was replayed or unterminated: %v %s", providers, output)
 				}
 			} else {
-				if len(providers) != 2 || providers[0] != providers[1] || requests[0] != requests[1] {
+				if len(providers) != 2 || providers[0] == providers[1] || requests[0] != requests[1] {
 					t.Fatalf("invalid replay: providers=%v requests=%v", providers, requests)
 				}
 				if strings.Contains(output, "resp_discard") {
