@@ -3046,7 +3046,7 @@ func (_h *HTTPAPI) handleChatCompletions(_w http.ResponseWriter, _r *http.Reques
 	_releaseContinuity := func(string) bool {
 		return strings.TrimSpace(_chatReq.ProviderID) == "" && strings.TrimSpace(_chatReq.Provider) == ""
 	}
-	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ChatRefusalTerminal, proxy.ChatStreamHeartbeat(), _releaseContinuity, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
+	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ChatRefusalTerminal, proxy.ChatRefusalTerminal, proxy.ChatStreamHeartbeat(), _releaseContinuity, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
 		return _h.Client.ForwardChatCompletion(_ctx, _attemptWriter, _r, _target, _model, &_chatReq, _body, _profile, _selectionMeta)
 	})
 }
@@ -3138,7 +3138,7 @@ func (_h *HTTPAPI) handleResponsesProxy(_w http.ResponseWriter, _r *http.Request
 		_r = _r.WithContext(context.WithValue(_r.Context(), turnRecoveryContextKey{}, true))
 		return true
 	}
-	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ResponsesFailureTerminal, proxy.ResponsesStreamHeartbeat(), _releaseContinuity, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
+	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ResponsesFailureTerminal, proxy.ResponsesRefusalTerminal, proxy.ResponsesStreamHeartbeat(), _releaseContinuity, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
 		var err error
 		if _rebindFrom != "" {
 			err = _h.rebindTurnBeforeDispatch(_turnRoute, _r, _rebindFrom, _target.Config.ID, _model.Name)
@@ -3434,7 +3434,7 @@ func startRetryKeepalive(_ctx context.Context, _deferred *deferredResponseWriter
 type providerForwardAttempt func(context.Context, http.ResponseWriter, *balancer.ProviderRuntime, *domain.LLMModelConfig, domain.RequestProfile, balancer.SelectionMeta) (proxy.ChatMetrics, error)
 
 // -------------------------------------------------------------------------------------
-func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Request, _request domain.ChatCompletionRequest, _started time.Time, _signals telemetry.RequestSignals, _refusalTerminal func(string) []byte, _heartbeat []byte, _releaseContinuity func(string) bool, _forward providerForwardAttempt) {
+func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Request, _request domain.ChatCompletionRequest, _started time.Time, _signals telemetry.RequestSignals, _refusalTerminal func(string) []byte, _throttleTerminal func(string) []byte, _heartbeat []byte, _releaseContinuity func(string) bool, _forward providerForwardAttempt) {
 	_trace := newRequestDiagnosticID()
 	_w.Header().Set("X-Proxy-Request-ID", _trace)
 	// 綁定請求維持較小的重試預算；容量備援也不能突破此上限。
@@ -3455,7 +3455,15 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		if _gateHeaders {
 			_rejectionWriter.AdoptCommitted()
 		}
-		if (_rejection.code == "request_retry_exhausted" || _gateHeaders) && _h.writeGracefulStreamTerminal(_w, _rejectionWriter, _request.Stream, _refusalTerminal, errors.New(_rejection.message)) {
+		// 額度用盡是代理的節流決定，不是上游故障。送 response.failed 會讓客戶端
+		// 判定回合中斷（Codex 顯示 stream disconnected before completion）並立刻重連，
+		// 反而把節流變成更吵的重試。改用「完成」型終止事件把原因當成助理訊息交付，
+		// agent 讀得到「請在 N 秒後重試」而不是崩潰。
+		_terminal := _refusalTerminal
+		if _rejection.code == "request_retry_exhausted" && _throttleTerminal != nil {
+			_terminal = _throttleTerminal
+		}
+		if (_rejection.code == "request_retry_exhausted" || _gateHeaders) && _h.writeGracefulStreamTerminal(_w, _rejectionWriter, _request.Stream, _terminal, errors.New(_rejection.message)) {
 			return
 		}
 		_h.writeJSON(_w, _rejection.status, domain.ErrorResponse(_rejection.code, _rejection.message))
@@ -3659,6 +3667,12 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_lastErr = _forwardErr
 		_lastDeferred = _deferred
 		_failurePolicy := proxy.ClassifyFailure(_forwardErr)
+		// 未向下游送出內容的容量拒絕，退回代理跨重連額度；每輪上限與來源冷卻不變。
+		// 這不是上游用量退款，也不能證明上游沒有執行工作。
+		if _shared != nil && _failurePolicy.Capacity && !_deferred.ContentWritten() && _shared.attempts > 0 {
+			_shared.attempts--
+			log.Printf("provider replay budget refunded: trace=%s content_written=false attempts=%d limit=%d", _trace, _shared.attempts, _shared.limit)
+		}
 		if _failurePolicy.Capacity && !_deferred.ContentWritten() && providerFailureCanRetryBeforeFirstToken(_forwardErr, _deferred) && _h.conversationPinIsReleasable(_r) && _releaseContinuity != nil && _releaseContinuity(_target.Config.ID) {
 			_request.ProviderID, _request.Provider = "", ""
 			_pinnedProvider = false

@@ -88,7 +88,10 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 		}
 		entry.limit = min(entry.limit, limit)
 		if entry.attempts >= entry.limit {
-			if entry.retryAt.IsZero() {
+			// 已允許重新選路時略過代理冷卻；實際來源仍須通過選路與上游冷卻檢查。
+			if entry.rebindFrom != "" {
+				entry.retryAt = time.Time{}
+			} else if entry.retryAt.IsZero() {
 				entry.retryAt = now.Add(reconnectRetryCooldown)
 			}
 			if now.Before(entry.retryAt) {
@@ -126,7 +129,8 @@ func (s *reconnectBudgetStore) release(key string, entry *reconnectBudget, succe
 	}
 	entry.active = false
 	entry.expires = time.Now().Add(reconnectRetention)
-	if entry.attempts >= entry.limit && !entry.delivered {
+	// 備妥換帳號的請求不進冷卻，理由同 acquire。
+	if entry.attempts >= entry.limit && !entry.delivered && entry.rebindFrom == "" {
 		entry.retryAt = time.Now().Add(reconnectRetryCooldown)
 	}
 }

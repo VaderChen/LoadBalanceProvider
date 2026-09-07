@@ -118,8 +118,20 @@ func TestExhaustedReplayUsesProtocolTerminal(t *testing.T) {
 		if w.Header().Get("Retry-After") == "" || !entry.retryAt.Equal(deadline) {
 			t.Fatal("cooldown header missing or blocked replay extended deadline")
 		}
-		if stream && (w.Code != 200 || !strings.Contains(w.Body.String(), "response.failed")) {
-			t.Fatalf("stream retry budget returned hard error: %d %s", w.Code, w.Body.String())
+		// 節流不是上游故障：送 response.failed 會讓 Codex 判定回合中斷
+		// （顯示 stream disconnected before completion）並立刻重連，
+		// 等於把節流變成更吵的重試。必須以「完成」型終止事件交付原因。
+		if stream {
+			body := w.Body.String()
+			if w.Code != 200 || !strings.Contains(body, "response.completed") {
+				t.Fatalf("stream retry budget returned hard error: %d %s", w.Code, body)
+			}
+			if strings.Contains(body, "response.failed") {
+				t.Fatalf("throttling must not be reported as an upstream failure: %s", body)
+			}
+			if !strings.Contains(body, "秒後重試") {
+				t.Fatalf("client cannot read the throttle reason: %s", body)
+			}
 		}
 		if !stream && w.Code != 429 {
 			t.Fatalf("non-stream retry budget status=%d", w.Code)
@@ -129,6 +141,23 @@ func TestExhaustedReplayUsesProtocolTerminal(t *testing.T) {
 		if rejection != nil || probe.limit-probe.attempts != 1 {
 			t.Fatal("cooldown replenished more than one probe")
 		}
+	}
+}
+
+func TestUnsafeReplayAfterGateHeartbeatRemainsFailure(t *testing.T) {
+	h := capacityTestHandler(t)
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	r = r.WithContext(proxy.WithResponseRouteOwner(r.Context(), "owner"))
+	r = r.WithContext(context.WithValue(r.Context(), turnGateHeadersKey{}, true))
+	body := []byte(`{"model":"smoke","stream":true,"prompt_cache_key":"unsafe","input":"hello"}`)
+	key := withReconnectIdentity(r, body).Context().Value(reconnectIdentityKey{}).(string)
+	entry, _ := h.reconnectBudgets.acquire(key, 2)
+	entry.attempts, entry.delivered = 1, true
+	h.reconnectBudgets.release(key, entry, false)
+	w := httptest.NewRecorder()
+	h.handleResponsesProxy(w, r, body)
+	if !strings.Contains(w.Body.String(), "response.failed") || strings.Contains(w.Body.String(), "response.completed") {
+		t.Fatalf("unsafe replay became a completed throttle notice: %s", w.Body.String())
 	}
 }
 
@@ -144,7 +173,9 @@ func TestCapacityCooldownProbeCanRebind(t *testing.T) {
 	entry, _ := h.reconnectBudgets.acquire(key, 2)
 	entry.attempts, entry.rebindFrom, entry.usedProviders = 2, "a", []string{"a"}
 	h.reconnectBudgets.release(key, entry, false)
-	entry.retryAt = time.Now().Add(-time.Second)
+	if !entry.retryAt.IsZero() {
+		t.Fatal("pending rebind entered local cooldown")
+	}
 	calls := 0
 	h.Client.HTTPClient = &http.Client{Transport: failoverSmokeTransport(func(req *http.Request) (*http.Response, error) {
 		calls++
@@ -230,5 +261,54 @@ func TestCapacityTurnGateHeartbeatCarriesIntoResponse(t *testing.T) {
 	rest, err := io.ReadAll(reader)
 	if err != nil || response.StatusCode != 200 || !strings.Contains(string(rest), "after_gate") {
 		t.Fatalf("response did not continue after gate heartbeat: status=%d body=%s err=%v", response.StatusCode, rest, err)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// 未送達內容的容量拒絕不消耗代理跨重連額度，仍保留每輪嘗試上限。
+func TestCapacityRejectionDoesNotConsumeReplayBudget(t *testing.T) {
+	h := capacityTestHandler(t)
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	r = r.WithContext(proxy.WithResponseRouteOwner(r.Context(), "owner"))
+	body := []byte(`{"model":"smoke","stream":true,"prompt_cache_key":"refund","input":"hello"}`)
+	key := withReconnectIdentity(r, body).Context().Value(reconnectIdentityKey{}).(string)
+
+	calls := 0
+	h.Client.HTTPClient = &http.Client{Transport: failoverSmokeTransport(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n"))}, nil
+	})}
+
+	w := httptest.NewRecorder()
+	h.handleResponsesProxy(w, r, body)
+	if calls == 0 {
+		t.Fatal("no upstream attempt was made")
+	}
+	if calls > 2 {
+		t.Fatalf("refund bypassed per-request attempt limit: %d", calls)
+	}
+	// 真正的上游故障仍須保留失敗語意。
+	if !strings.Contains(w.Body.String(), "response.failed") || strings.Contains(w.Body.String(), "response.completed") {
+		t.Fatalf("upstream failure was reported as completion: %s", w.Body.String())
+	}
+	// 全部嘗試皆未送達內容，額度退回；若曾首次排隊仍保留等待紀錄。
+	if entry := h.reconnectBudgets.entries[key]; entry != nil {
+		if entry.attempts != 0 {
+			t.Fatalf("capacity rejections consumed %d replay attempts", entry.attempts)
+		}
+		// 允許重新選路時不另加代理冷卻。
+		if entry.rebindFrom != "" && !entry.retryAt.IsZero() {
+			t.Fatalf("a pending rebind must not be parked behind a cooldown: rebindFrom=%s retryAt=%v", entry.rebindFrom, entry.retryAt)
+		}
+	}
+
+	// 關鍵：用戶端重連時必須拿到完整額度，而不是一則「額度已用盡」的節流訊息。
+	next, rejection := h.reconnectBudgets.acquire(key, 3)
+	if rejection != nil {
+		t.Fatalf("a capacity storm must not block the next reconnect: %s", rejection.code)
+	}
+	if next.attempts != 0 {
+		t.Fatalf("reconnect started with %d attempts already spent", next.attempts)
 	}
 }

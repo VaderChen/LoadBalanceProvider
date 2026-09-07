@@ -371,11 +371,10 @@ func (_c *Client) ForwardMultimodal(_ctx context.Context, _w http.ResponseWriter
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) ForwardResponses(_ctx context.Context, _w http.ResponseWriter, _srcReq *http.Request, _provider *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _rawBody []byte, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (ChatMetrics, error) {
-	if isOpenAICodexProvider(_provider) {
-		if writer, ok := _w.(interface{ DeferStreamUntilSuccess() }); ok {
-			writer.DeferStreamUntilSuccess()
-		}
-	}
+	// 刻意不啟用 DeferStreamUntilSuccess：整段緩衝到成功才送出雖然讓失敗可以無痕
+	// 重試，但代價是客戶端要等整個回應產生完才看得到第一個字，逐字顯示會消失。
+	// 逐字顯示是產品需求，優先於「串流開始後還能重試」——
+	// 一旦內容送出就不重試的既有行為（ContentWritten 判準）已經是正確的收斂點。
 	return _c.ForwardResponsesRoute(_ctx, _w, _srcReq, _provider, _model, ResponsesProxyRoute{Method: http.MethodPost, Path: "/v1/responses"}, _rawBody, _profile, _selectionMeta)
 }
 
