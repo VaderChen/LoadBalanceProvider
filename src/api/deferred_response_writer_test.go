@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,60 @@ import (
 
 	"LoadBalanceProvider/src/proxy"
 )
+
+func TestToolDeliveryAcrossWrites(t *testing.T) {
+	for _, event := range []string{
+		"data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{}\"}\n\n",
+		"event: response.custom_tool_call_input.done\r\ndata: {\"input\":\"command\"}\r\n\r\n",
+		"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\"}}\n\n",
+	} {
+		w := newDeferredResponseWriter(httptest.NewRecorder(), true)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"text\"}\n\n"))
+		for i := range event {
+			if w.ToolCallDelivered() {
+				t.Fatalf("tool marked delivered before event boundary at %d", i)
+			}
+			if _, err := w.Write([]byte(event[i : i+1])); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !w.ToolCallDelivered() {
+			t.Fatalf("fragmented tool completion missed: %s", event)
+		}
+	}
+}
+
+type limitedToolWriter struct {
+	*httptest.ResponseRecorder
+	remaining int
+}
+
+func (w *limitedToolWriter) Write(data []byte) (int, error) {
+	n := min(w.remaining, len(data))
+	w.remaining -= n
+	_, _ = w.ResponseRecorder.Write(data[:n])
+	if n != len(data) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
+}
+
+func TestToolDeliveryRequiresWrittenCompletion(t *testing.T) {
+	event := []byte("data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{}\"}\n\n")
+	for _, accepted := range []int{0, len(event) - 1, len(event)} {
+		for _, buffered := range []bool{false, true} {
+			target := &limitedToolWriter{httptest.NewRecorder(), accepted}
+			w := newDeferredResponseWriter(target, true)
+			if !buffered {
+				w.contentWritten = true
+			}
+			_, _ = w.Write(event)
+			if w.ToolCallDelivered() != (accepted == len(event)) {
+				t.Fatalf("incorrect delivery state: accepted=%d buffered=%v", accepted, buffered)
+			}
+		}
+	}
+}
 
 func TestDeferredInitializationRemainsBufferedAfterHeartbeatSmoke(t *testing.T) {
 	r := httptest.NewRecorder()

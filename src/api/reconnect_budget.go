@@ -84,7 +84,7 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 	}
 	if entry != nil {
 		if entry.delivered {
-			return nil, &reconnectRejection{http.StatusBadRequest, 0, "request_replay_unsafe", "此請求已輸出部分內容後中斷，不自動重播；請確認工具結果並提出新的接續請求"}
+			return nil, &reconnectRejection{http.StatusBadRequest, 0, "request_replay_unsafe", "此請求已交付完整工具呼叫後中斷，不自動重播；請確認工具結果並提出新的接續請求"}
 		}
 		entry.limit = min(entry.limit, limit)
 		if entry.attempts >= entry.limit {

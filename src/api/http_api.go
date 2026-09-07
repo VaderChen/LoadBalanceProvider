@@ -3460,10 +3460,10 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		// 反而把節流變成更吵的重試。改用「完成」型終止事件把原因當成助理訊息交付，
 		// agent 讀得到「請在 N 秒後重試」而不是崩潰。
 		_terminal := _refusalTerminal
-		if _rejection.code == "request_retry_exhausted" && _throttleTerminal != nil {
+		if (_rejection.code == "request_retry_exhausted" || _rejection.code == "request_replay_unsafe") && _throttleTerminal != nil {
 			_terminal = _throttleTerminal
 		}
-		if (_rejection.code == "request_retry_exhausted" || _gateHeaders) && _h.writeGracefulStreamTerminal(_w, _rejectionWriter, _request.Stream, _terminal, errors.New(_rejection.message)) {
+		if (_rejection.code == "request_retry_exhausted" || _rejection.code == "request_replay_unsafe" || _gateHeaders) && _h.writeGracefulStreamTerminal(_w, _rejectionWriter, _request.Stream, _terminal, errors.New(_rejection.message)) {
 			return
 		}
 		_h.writeJSON(_w, _rejection.status, domain.ErrorResponse(_rejection.code, _rejection.message))
@@ -3623,7 +3623,9 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_metrics, _forwardErr := _forward(_ctx, _deferred, _target, _model, _profile, _selectionMeta)
 		_stopKeepalive()
 		_cancel()
-		if _shared != nil && _deferred.ContentWritten() {
+		// 跨重連封鎖以已交付的完整工具呼叫為準；文字與推理可能重複顯示，
+		// 但不因此觸發工具防重播。同一條串流的重試仍受 ContentWritten 限制。
+		if _shared != nil && _deferred.ToolCallDelivered() {
 			_shared.delivered = true
 		}
 		proxy.EnrichFailure(_forwardErr, _deferred.BufferedBody())
@@ -3639,7 +3641,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		if _forwardErr == nil {
 			if _commitErr := _deferred.Commit(); _commitErr != nil {
 				_forwardErr = _commitErr
-				if _shared != nil && _deferred.ContentWritten() {
+				if _shared != nil && _deferred.ToolCallDelivered() {
 					_shared.delivered = true
 				}
 			} else {

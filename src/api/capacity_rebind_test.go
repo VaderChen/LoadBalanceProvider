@@ -144,7 +144,7 @@ func TestExhaustedReplayUsesProtocolTerminal(t *testing.T) {
 	}
 }
 
-func TestUnsafeReplayAfterGateHeartbeatRemainsFailure(t *testing.T) {
+func TestUnsafeReplayAfterGateHeartbeatUsesCompletedNotice(t *testing.T) {
 	h := capacityTestHandler(t)
 	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	r = r.WithContext(proxy.WithResponseRouteOwner(r.Context(), "owner"))
@@ -156,8 +156,8 @@ func TestUnsafeReplayAfterGateHeartbeatRemainsFailure(t *testing.T) {
 	h.reconnectBudgets.release(key, entry, false)
 	w := httptest.NewRecorder()
 	h.handleResponsesProxy(w, r, body)
-	if !strings.Contains(w.Body.String(), "response.failed") || strings.Contains(w.Body.String(), "response.completed") {
-		t.Fatalf("unsafe replay became a completed throttle notice: %s", w.Body.String())
+	if strings.Contains(w.Body.String(), "response.failed") || !strings.Contains(w.Body.String(), "response.completed") || !strings.Contains(w.Body.String(), "完整工具呼叫") {
+		t.Fatalf("unsafe replay did not produce a completed notice: %s", w.Body.String())
 	}
 }
 
@@ -310,5 +310,86 @@ func TestCapacityRejectionDoesNotConsumeReplayBudget(t *testing.T) {
 	}
 	if next.attempts != 0 {
 		t.Fatalf("reconnect started with %d attempts already spent", next.attempts)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// 重播封鎖只該針對「客戶端可能已經執行過的工具呼叫」。
+// 用「有 bytes 送出」當判準，會讓串到一半斷掉的回合變成永久死路：
+// 客戶端重送被 400 擋住，再送再擋，agent 完全走不下去。
+func TestReplayBlockedOnlyByDeliveredToolCall(t *testing.T) {
+	prose := newDeferredResponseWriter(httptest.NewRecorder(), true)
+	if _, err := prose.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"半句話\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !prose.ContentWritten() {
+		t.Fatal("text should count as delivered content")
+	}
+	if prose.ToolCallDelivered() {
+		t.Fatal("plain text must not trigger the tool replay guard")
+	}
+
+	reasoning := newDeferredResponseWriter(httptest.NewRecorder(), true)
+	if _, err := reasoning.Write([]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if reasoning.ToolCallDelivered() {
+		t.Fatal("reasoning summaries must stay replayable")
+	}
+
+	// 此策略假設客戶端等待完整工具呼叫才執行。
+	partial := newDeferredResponseWriter(httptest.NewRecorder(), true)
+	if _, err := partial.Write([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"path\\\"\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if partial.ToolCallDelivered() {
+		t.Fatal("an incomplete tool call must not trigger the tool replay guard")
+	}
+
+	for _, done := range []string{
+		"data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{}\"}\n\n",
+		"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"local_shell_call\",\"id\":\"c1\"}}\n\n",
+	} {
+		w := newDeferredResponseWriter(httptest.NewRecorder(), true)
+		if _, err := w.Write([]byte(done)); err != nil {
+			t.Fatal(err)
+		}
+		if !w.ToolCallDelivered() {
+			t.Fatalf("a completed tool call must block replay: %s", done)
+		}
+	}
+}
+
+func TestReplayLedgerTracksDeliveredTools(t *testing.T) {
+	for _, kind := range []string{"response.output_text.delta", "response.reasoning_summary_text.delta", "response.function_call_arguments.delta", "response.function_call_arguments.done"} {
+		t.Run(kind, func(t *testing.T) {
+			h := capacityTestHandler(t)
+			r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			r = r.WithContext(proxy.WithResponseRouteOwner(r.Context(), "owner"))
+			body := []byte(`{"model":"smoke","stream":true,"prompt_cache_key":"ledger","input":"hello"}`)
+			key := withReconnectIdentity(r, body).Context().Value(reconnectIdentityKey{}).(string)
+			calls := 0
+			h.Client.HTTPClient = &http.Client{Transport: failoverSmokeTransport(func(req *http.Request) (*http.Response, error) {
+				calls++
+				payload, _ := json.Marshal(map[string]string{"type": kind, "delta": "text", "arguments": "{}"})
+				stream := "data: " + string(payload) + "\n\ndata: {\"type\":\"error\",\"message\":\"Our servers are currently overloaded\"}\n\n"
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}, nil
+			})}
+			h.handleResponsesProxy(httptest.NewRecorder(), r, body)
+			if calls != 1 {
+				t.Fatalf("replayed inside an already-started stream: %d", calls)
+			}
+			entry, rejection := h.reconnectBudgets.acquire(key, 2)
+			if strings.HasSuffix(kind, ".done") {
+				if rejection == nil || rejection.code != "request_replay_unsafe" {
+					t.Fatal("delivered tool did not block reconnect replay")
+				}
+			} else {
+				if rejection != nil || entry.delivered {
+					t.Fatalf("non-tool content blocked reconnect: %+v", rejection)
+				}
+				h.reconnectBudgets.release(key, entry, false)
+			}
+		})
 	}
 }

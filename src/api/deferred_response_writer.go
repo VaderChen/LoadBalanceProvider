@@ -35,6 +35,10 @@ type deferredResponseWriter struct {
 	// 客戶端只是多收到幾個會被忽略的 ping。
 	contentWritten   bool
 	firstCommitEvent string
+	// toolCallDelivered 表示「完整的工具呼叫」已經送達客戶端。
+	// 用來封鎖跨重連重播；文字與推理仍可能重複顯示，但不因此封鎖。
+	toolCallDelivered bool
+	toolEventPending  string
 	// pendingContent 表示緩衝裡有尚未送出的回應內容。只有在 commit 時才會
 	// 升級成 contentWritten —— 沒送出去的內容不該剝奪重試能力。
 	pendingContent bool
@@ -90,12 +94,12 @@ func (_w *deferredResponseWriter) Write(_data []byte) (int, error) {
 	if _w.contentWritten && _w.statusCode < http.StatusBadRequest {
 		defer _w.boundWriteLocked()()
 		if _w.buffer.Len() > 0 {
-			if _, _err := io.Copy(_w.target, &_w.buffer); _err != nil {
+			if _err := _w.writeBufferedLocked(); _err != nil {
 				return 0, _err
 			}
 		}
 		_w.contentWritten = true
-		return _w.target.Write(_data)
+		return _w.writeDeliveredLocked(_data)
 	}
 	_w.pendingContent = true
 	if _w.deferUntilSuccess && len(_data) > deferredResponseBufferLimit-_w.buffer.Len() {
@@ -224,7 +228,7 @@ func (_w *deferredResponseWriter) commitLocked() error {
 		_w.contentWritten = true
 	}
 	if _w.buffer.Len() > 0 {
-		_, _w.writeErr = io.Copy(_w.target, &_w.buffer)
+		_w.writeErr = _w.writeBufferedLocked()
 	}
 	flushHTTPResponseWriter(_w.target)
 	return _w.writeErr
@@ -293,7 +297,7 @@ func (_w *deferredResponseWriter) Committed() bool {
 }
 
 // -------------------------------------------------------------------------------------
-// ContentWritten 表示真正的回應內容已經送給客戶端 —— 這才是「不能再重試」的判準。
+// ContentWritten 限制同一條串流內的自動重試；跨重連工具防重播另用 ToolCallDelivered。
 // 只送過保活心跳的串流仍可換帳號重試。
 func (_w *deferredResponseWriter) ContentWritten() bool {
 	if _w == nil {
@@ -344,6 +348,71 @@ func flushHTTPResponseWriter(_writer http.ResponseWriter) {
 // -------------------------------------------------------------------------------------
 func streamBufferHasForwardableEvent(_data []byte) bool {
 	return streamBufferForwardableEvent(_data) != ""
+}
+
+// ToolCallDelivered 表示完整的工具呼叫已經送達客戶端，重播可能造成重複執行。
+func (_w *deferredResponseWriter) ToolCallDelivered() bool {
+	if _w == nil {
+		return false
+	}
+	_w.lock.Lock()
+	defer _w.lock.Unlock()
+	return _w.toolCallDelivered
+}
+
+// 只追蹤下游接受的位元組；Write 成功不代表客戶端已確認執行。
+func (_w *deferredResponseWriter) writeDeliveredLocked(data []byte) (int, error) {
+	n, err := _w.target.Write(data)
+	if n > 0 {
+		_w.noteToolCallDeliveredLocked(data[:n])
+	}
+	if n < len(data) && err == nil {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func (_w *deferredResponseWriter) writeBufferedLocked() error {
+	n, err := _w.writeDeliveredLocked(_w.buffer.Bytes())
+	_w.buffer.Next(n)
+	return err
+}
+
+// 跨 Write 保留未完成的 SSE frame，不能把半個 JSON 或未結束事件當成工具交付。
+func (_w *deferredResponseWriter) noteToolCallDeliveredLocked(_data []byte) {
+	if !_w.stream || _w.toolCallDelivered || len(_data) == 0 {
+		return
+	}
+	_w.toolEventPending = strings.ReplaceAll(_w.toolEventPending+string(_data), "\r\n", "\n")
+	end := strings.LastIndex(_w.toolEventPending, "\n\n")
+	if end < 0 {
+		return
+	}
+	complete := _w.toolEventPending[:end+2]
+	_w.toolEventPending = strings.Clone(_w.toolEventPending[end+2:])
+	for _, _frame := range proxy.ParseSSEDataFrames(complete) {
+		var _payload map[string]interface{}
+		if json.Unmarshal([]byte(strings.TrimSpace(_frame.Data)), &_payload) != nil || _payload == nil {
+			continue
+		}
+		_kind := strings.ToLower(strings.TrimSpace(stringValue(_payload["type"])))
+		if _kind == "" {
+			_kind = strings.ToLower(strings.TrimSpace(_frame.Event))
+		}
+		if strings.HasSuffix(_kind, "_call_arguments.done") || _kind == "response.custom_tool_call_input.done" {
+			_w.toolCallDelivered = true
+			_w.toolEventPending = ""
+			return
+		}
+		if _kind == "response.output_item.done" {
+			if _item, _ok := _payload["item"].(map[string]interface{}); _ok &&
+				strings.HasSuffix(strings.ToLower(strings.TrimSpace(stringValue(_item["type"]))), "_call") {
+				_w.toolCallDelivered = true
+				_w.toolEventPending = ""
+				return
+			}
+		}
+	}
 }
 
 func streamBufferForwardableEvent(_data []byte) string {
