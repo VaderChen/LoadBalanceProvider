@@ -173,10 +173,13 @@ func (_c *Client) forwardOpenAICodexCompletion(_ctx context.Context, _w http.Res
 	writeProxyHeaders(_w, _provider, _model, _profile, _selectionMeta, _outboundStream)
 	if _outboundStream {
 		_w.WriteHeader(http.StatusOK)
-		flushResponse(_w)
+		if err := flushResponse(_w); err != nil {
+			return ChatMetrics{}, err
+		}
 		_idleReader := newStreamIdleTimeoutReader(resp.Body, providerStreamIdleTimeout(_provider))
 		defer _idleReader.Stop()
-		return streamCodexResponsesAsChat(_w, _idleReader, _upstreamModel, _started)
+		metrics, err := streamCodexResponsesAsChat(_w, _idleReader, _upstreamModel, _started)
+		return metrics, retainStreamRetryAfter(err, resp.Header)
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
@@ -273,7 +276,9 @@ func (_c *Client) forwardOpenAICodexResponsesRoute(_ctx context.Context, _w http
 	writeProxyHeaders(_w, _provider, _model, _profile, _selectionMeta, _stream)
 	_w.WriteHeader(resp.StatusCode)
 	if _stream {
-		flushResponse(_w)
+		if err := flushResponse(_w); err != nil {
+			return ChatMetrics{}, err
+		}
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -286,7 +291,8 @@ func (_c *Client) forwardOpenAICodexResponsesRoute(_ctx context.Context, _w http
 	}
 
 	if _stream {
-		return streamCopyWithProviderIdleTimeout(_w, resp.Body, _started, true, _c.responseRouteRecorder(_route, _provider, _model, _srcReq, _body), _provider, responsesStreamHeartbeat(), responsesRefusalTerminal, responsesStreamFailureTerminal)
+		metrics, err := streamCopyWithProviderIdleTimeout(_w, resp.Body, _started, true, _c.responseRouteRecorder(_route, _provider, _model, _srcReq, _body), _provider, responsesStreamHeartbeat(), responsesRefusalTerminal, responsesStreamFailureTerminal)
+		return metrics, retainStreamRetryAfter(err, resp.Header)
 	}
 
 	_respBody, err := io.ReadAll(resp.Body)
@@ -1151,9 +1157,11 @@ func writeOpenAIStreamChunk(_w http.ResponseWriter, _chunk map[string]interface{
 	}
 	line := "data: " + string(data) + "\n\n"
 	if _, err := _w.Write([]byte(line)); err != nil {
+		return DownstreamError(err)
+	}
+	if err := flushResponse(_w); err != nil {
 		return err
 	}
-	flushResponse(_w)
 	eventMetrics := streamEventMetrics(line)
 	if _metrics.FirstResponseMS <= 0 && eventMetrics.ContentSeen {
 		eventMetrics.FirstResponseMS = durationMilliseconds(time.Since(_started))
@@ -1168,10 +1176,9 @@ func writeOpenAIStreamChunk(_w http.ResponseWriter, _chunk map[string]interface{
 // -------------------------------------------------------------------------------------
 func writeOpenAIStreamDone(_w http.ResponseWriter) error {
 	if _, err := _w.Write([]byte("data: [DONE]\n\n")); err != nil {
-		return err
+		return DownstreamError(err)
 	}
-	flushResponse(_w)
-	return nil
+	return flushResponse(_w)
 }
 
 // -------------------------------------------------------------------------------------

@@ -90,6 +90,9 @@ func (_w *deferredResponseWriter) WriteHeader(_statusCode int) {
 func (_w *deferredResponseWriter) Write(_data []byte) (int, error) {
 	_w.lock.Lock()
 	defer _w.lock.Unlock()
+	if _w.writeErr != nil {
+		return 0, _w.writeErr
+	}
 	// 這裡寫的一律是真正的回應內容（心跳走 WriteStreamHeartbeat）。
 	if _w.contentWritten && _w.statusCode < http.StatusBadRequest {
 		defer _w.boundWriteLocked()()
@@ -137,13 +140,21 @@ func (_w *deferredResponseWriter) Write(_data []byte) (int, error) {
 
 // -------------------------------------------------------------------------------------
 func (_w *deferredResponseWriter) Flush() {
+	_ = _w.FlushError()
+}
+
+func (_w *deferredResponseWriter) FlushError() error {
 	_w.lock.Lock()
 	defer _w.lock.Unlock()
+	if _w.writeErr != nil {
+		return _w.writeErr
+	}
 	if !_w.committed {
-		return
+		return nil
 	}
 	defer _w.boundWriteLocked()()
-	flushHTTPResponseWriter(_w.target)
+	_w.writeErr = proxy.DownstreamError(proxy.FlushResponseWriter(_w.target))
+	return _w.writeErr
 }
 
 // WriteStreamHeartbeat 送出保活心跳。它必須 commit（header 得先送出去客戶端才會
@@ -156,6 +167,9 @@ func (_w *deferredResponseWriter) WriteStreamHeartbeat(_data []byte) error {
 	}
 	_w.lock.Lock()
 	defer _w.lock.Unlock()
+	if _w.writeErr != nil {
+		return _w.writeErr
+	}
 	if _w.statusCode >= http.StatusBadRequest {
 		return nil
 	}
@@ -169,12 +183,13 @@ func (_w *deferredResponseWriter) WriteStreamHeartbeat(_data []byte) error {
 		_w.target.WriteHeader(http.StatusOK)
 		_w.committed = true
 	}
-	_, _w.writeErr = _w.target.Write(_data)
+	n, err := _w.target.Write(_data)
+	if err == nil && n != len(_data) {
+		err = io.ErrShortWrite
+	}
+	_w.writeErr = proxy.DownstreamError(err)
 	if _w.writeErr == nil {
-		_w.writeErr = proxy.FlushResponseWriter(_w.target)
-		if errors.Is(_w.writeErr, http.ErrNotSupported) {
-			_w.writeErr = nil
-		}
+		_w.writeErr = proxy.DownstreamError(proxy.FlushResponseWriter(_w.target))
 	}
 	return _w.writeErr
 }
@@ -199,6 +214,9 @@ func (_w *deferredResponseWriter) Commit() error {
 func (_w *deferredResponseWriter) commitLocked() error {
 	if _w == nil {
 		return nil
+	}
+	if _w.writeErr != nil {
+		return _w.writeErr
 	}
 	if _w.deferUntilSuccess && _w.pendingContent {
 		if err := validateBufferedResponse(_w.buffer.String()); err != nil {
@@ -230,7 +248,9 @@ func (_w *deferredResponseWriter) commitLocked() error {
 	if _w.buffer.Len() > 0 {
 		_w.writeErr = _w.writeBufferedLocked()
 	}
-	flushHTTPResponseWriter(_w.target)
+	if _w.writeErr == nil {
+		_w.writeErr = proxy.DownstreamError(proxy.FlushResponseWriter(_w.target))
+	}
 	return _w.writeErr
 }
 
@@ -369,7 +389,8 @@ func (_w *deferredResponseWriter) writeDeliveredLocked(data []byte) (int, error)
 	if n < len(data) && err == nil {
 		err = io.ErrShortWrite
 	}
-	return n, err
+	_w.writeErr = proxy.DownstreamError(err)
+	return n, _w.writeErr
 }
 
 func (_w *deferredResponseWriter) writeBufferedLocked() error {
@@ -410,6 +431,20 @@ func (_w *deferredResponseWriter) noteToolCallDeliveredLocked(_data []byte) {
 				_w.toolCallDelivered = true
 				_w.toolEventPending = ""
 				return
+			}
+		}
+		if _kind == "response.completed" {
+			// 部分相容上游只在完成事件交付 output，沒有逐項 done 事件。
+			response, _ := _payload["response"].(map[string]interface{})
+			items, _ := response["output"].([]interface{})
+			for _, value := range items {
+				item, _ := value.(map[string]interface{})
+				status := strings.ToLower(strings.TrimSpace(stringValue(item["status"])))
+				if (status == "" || status == "completed") && strings.HasSuffix(strings.ToLower(strings.TrimSpace(stringValue(item["type"]))), "_call") {
+					_w.toolCallDelivered = true
+					_w.toolEventPending = ""
+					return
+				}
 			}
 		}
 	}

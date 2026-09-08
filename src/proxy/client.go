@@ -135,6 +135,7 @@ type ResponsesProxyRoute struct {
 
 // -------------------------------------------------------------------------------------
 type ResponseRouteTarget struct {
+	Persisted  bool `json:"-"`
 	ProviderID string
 	Model      string
 	Owner      string
@@ -302,7 +303,9 @@ func (_c *Client) ForwardChatCompletion(_ctx context.Context, _w http.ResponseWr
 				_, _ = io.Copy(_w, _resp.Body)
 			}
 			if _chatReq.Stream {
-				flushResponse(_w)
+				if err := flushResponse(_w); err != nil {
+					return ChatMetrics{}, err
+				}
 			}
 			return ChatMetrics{}, &ProviderStatusError{FailureDetails: FailureDetails{RetryAfter: retryAfterHeader(_resp.Header)}, StatusCode: _resp.StatusCode, ResponseForwarded: true}
 		}
@@ -312,11 +315,14 @@ func (_c *Client) ForwardChatCompletion(_ctx context.Context, _w http.ResponseWr
 	writeProxyHeaders(_w, _provider, _model, _profile, _selectionMeta, _chatReq.Stream)
 	_w.WriteHeader(_resp.StatusCode)
 	if _chatReq.Stream {
-		flushResponse(_w)
+		if err := flushResponse(_w); err != nil {
+			return ChatMetrics{}, err
+		}
 	}
 
 	if _chatReq.Stream {
-		return streamCopyWithProviderIdleTimeout(_w, _resp.Body, _requestStarted, _forwardStreamUsage, nil, _provider, chatStreamHeartbeat(), chatRefusalTerminal, nil)
+		metrics, err := streamCopyWithProviderIdleTimeout(_w, _resp.Body, _requestStarted, _forwardStreamUsage, nil, _provider, chatStreamHeartbeat(), chatRefusalTerminal, nil)
+		return metrics, retainStreamRetryAfter(err, _resp.Header)
 	}
 
 	_respBody, _err := io.ReadAll(_resp.Body)
@@ -354,7 +360,9 @@ func (_c *Client) ForwardMultimodal(_ctx context.Context, _w http.ResponseWriter
 	writeProxyHeaders(_w, _provider, _model, _profile, _selectionMeta, _stream)
 	_w.WriteHeader(_resp.StatusCode)
 	if _stream {
-		flushResponse(_w)
+		if err := flushResponse(_w); err != nil {
+			return err
+		}
 	}
 
 	var _copyErr error
@@ -401,7 +409,9 @@ func (_c *Client) ForwardResponsesRoute(_ctx context.Context, _w http.ResponseWr
 	writeProxyHeaders(_w, _provider, _model, _profile, _selectionMeta, _stream)
 	_w.WriteHeader(_resp.StatusCode)
 	if _stream {
-		flushResponse(_w)
+		if err := flushResponse(_w); err != nil {
+			return ChatMetrics{}, err
+		}
 	}
 
 	if _resp.StatusCode < http.StatusOK || _resp.StatusCode >= http.StatusMultipleChoices {
@@ -414,7 +424,8 @@ func (_c *Client) ForwardResponsesRoute(_ctx context.Context, _w http.ResponseWr
 	}
 
 	if _stream {
-		return streamCopyWithProviderIdleTimeout(_w, _resp.Body, _requestStarted, true, _c.responseRouteRecorder(_route, _provider, _model, _srcReq, _body), _provider, responsesStreamHeartbeat(), responsesRefusalTerminal, responsesStreamFailureTerminal)
+		metrics, err := streamCopyWithProviderIdleTimeout(_w, _resp.Body, _requestStarted, true, _c.responseRouteRecorder(_route, _provider, _model, _srcReq, _body), _provider, responsesStreamHeartbeat(), responsesRefusalTerminal, responsesStreamFailureTerminal)
+		return metrics, retainStreamRetryAfter(err, _resp.Header)
 	}
 
 	_respBody, _err := io.ReadAll(_resp.Body)
@@ -560,12 +571,14 @@ func copyAndFlush(_w http.ResponseWriter, _reader io.Reader) (int64, error) {
 		if _count > 0 {
 			_writeCount, _writeErr := _w.Write(_buffer[:_count])
 			_written += int64(_writeCount)
-			flushResponse(_w)
 			if _writeErr != nil {
-				return _written, _writeErr
+				return _written, DownstreamError(_writeErr)
+			}
+			if err := flushResponse(_w); err != nil {
+				return _written, err
 			}
 			if _writeCount != _count {
-				return _written, io.ErrShortWrite
+				return _written, DownstreamError(io.ErrShortWrite)
 			}
 		}
 		if _err != nil {
@@ -1452,15 +1465,7 @@ func streamCopyWithProviderIdleTimeout(_w http.ResponseWriter, _reader io.ReadCl
 // generation for either wire: chat ([DONE] / finish_reason) or Responses
 // (response.completed / failed / incomplete / cancelled).
 func streamEventIsTerminalMarker(_body string) bool {
-	if strings.Contains(_body, "[DONE]") {
-		return true
-	}
-	for _, _terminal := range []string{"response.completed", "response.failed", "response.incomplete", "response.cancelled"} {
-		if strings.Contains(_body, _terminal) {
-			return true
-		}
-	}
-	return streamEventHasFinishReason(_body)
+	return streamEventHasDoneMarker(_body) || streamEventHasResponsesTerminalEvent(_body) || streamEventHasFinishReason(_body)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1626,7 +1631,7 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 		_resultValue := <-_result
 		_resultValue.Metrics.mergeClientDelivery(_writerMetrics)
 		_resultValue.Metrics.finalizeClientDelivery()
-		return _resultValue.Metrics, _writeErr
+		return _resultValue.Metrics, DownstreamError(_writeErr)
 	}
 
 	go readProviderStream(_reader, _started, _forwardUsage, _events, _result, _done)
@@ -1663,7 +1668,9 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 				if _, _writeErr := _w.Write(_failureTerminal(errors.New(_event.TerminalError))); _writeErr != nil {
 					return _abort(_writeErr)
 				}
-				flushResponse(_w)
+				if err := flushResponse(_w); err != nil {
+					return _abort(err)
+				}
 				_resultValue := <-_result
 				_resultValue.Metrics.mergeClientDelivery(_writerMetrics)
 				_resultValue.Metrics.finalizeClientDelivery()
@@ -1674,7 +1681,9 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 				if _, _writeErr := _w.Write(_refusalTerminal(_event.TerminalError)); _writeErr != nil {
 					return _abort(_writeErr)
 				}
-				flushResponse(_w)
+				if err := flushResponse(_w); err != nil {
+					return _abort(err)
+				}
 				_resultValue := <-_result
 				_resultValue.Metrics.mergeClientDelivery(_writerMetrics)
 				_resultValue.Metrics.finalizeClientDelivery()
@@ -1692,7 +1701,9 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 			if _, _writeErr := _w.Write([]byte(_body)); _writeErr != nil {
 				return _abort(_writeErr)
 			}
-			flushResponse(_w)
+			if err := flushResponse(_w); err != nil {
+				return _abort(err)
+			}
 			_resetHeartbeat()
 			if _event.HasContent && responseWriterContentWritten(_w, true) {
 				_writerMetrics.recordClientContentWrite(time.Since(_started))
@@ -1729,9 +1740,11 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 		if _failureTerminal != nil && !errors.Is(_resultValue.Err, context.Canceled) &&
 			responseWriterContentWritten(_w, _writerMetrics.ClientContentItems > 0) {
 			if _, _writeErr := _w.Write(_failureTerminal(_resultValue.Err)); _writeErr != nil {
-				return _metrics, _writeErr
+				return _metrics, DownstreamError(_writeErr)
 			}
-			flushResponse(_w)
+			if err := flushResponse(_w); err != nil {
+				return _metrics, err
+			}
 			_metrics.TerminalSeen = true
 			return _metrics, &ProviderStreamError{
 				Message:           _resultValue.Err.Error(),
@@ -1746,9 +1759,11 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 				return _metrics, errResponsesStreamMissingTerminal
 			}
 			if _, _writeErr := _w.Write(_failureTerminal(errResponsesStreamMissingTerminal)); _writeErr != nil {
-				return _metrics, _writeErr
+				return _metrics, DownstreamError(_writeErr)
 			}
-			flushResponse(_w)
+			if err := flushResponse(_w); err != nil {
+				return _metrics, err
+			}
 			_metrics.TerminalSeen = true
 			return _metrics, &ProviderStreamError{
 				Message:           errResponsesStreamMissingTerminal.Error(),
@@ -1756,9 +1771,11 @@ func streamCopyWithResponseRecorderHeartbeat(_w http.ResponseWriter, _reader io.
 			}
 		}
 		if _, _writeErr := _w.Write([]byte("\n\ndata: [DONE]\n\n")); _writeErr != nil {
-			return _metrics, _writeErr
+			return _metrics, DownstreamError(_writeErr)
 		}
-		flushResponse(_w)
+		if err := flushResponse(_w); err != nil {
+			return _metrics, err
+		}
 	}
 	return _metrics, nil
 }
@@ -1780,11 +1797,12 @@ func writeDownstreamStreamHeartbeat(_w http.ResponseWriter, _heartbeat []byte) e
 	if _writer, _ok := _w.(interface{ WriteStreamHeartbeat([]byte) error }); _ok {
 		return _writer.WriteStreamHeartbeat(_heartbeat)
 	}
-	if _, _err := _w.Write(_heartbeat); _err != nil {
-		return _err
+	if n, err := _w.Write(_heartbeat); err != nil {
+		return DownstreamError(err)
+	} else if n != len(_heartbeat) {
+		return DownstreamError(io.ErrShortWrite)
 	}
-	flushResponse(_w)
-	return nil
+	return flushResponse(_w)
 }
 
 // -------------------------------------------------------------------------------------
@@ -2469,7 +2487,7 @@ func (_m *ChatMetrics) mergeProviderEvent(_event string, _started time.Time, _do
 	}
 	_m.merge(_eventMetrics)
 	_terminalError := responsesTerminalErrorMessage(_event)
-	if _terminalError != "" || strings.Contains(_event, "[DONE]") || streamEventHasResponsesTerminalEvent(_event) {
+	if _terminalError != "" || streamEventHasDoneMarker(_event) || streamEventHasResponsesTerminalEvent(_event) {
 		*_doneSeen = true
 	}
 	// OpenAI-compatible providers send the optional usage/timings chunk after the
@@ -2701,27 +2719,16 @@ func providerErrorTextIsRequestRejection(_text string) bool {
 
 // -------------------------------------------------------------------------------------
 func streamEventHasResponsesTerminalEvent(_event string) bool {
-	for _, _line := range strings.Split(_event, "\n") {
-		_line = strings.TrimSpace(_line)
-		if strings.HasPrefix(_line, "event:") {
-			switch strings.TrimSpace(strings.TrimPrefix(_line, "event:")) {
-			case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
-				return true
-			}
-			continue
-		}
-		if !strings.HasPrefix(_line, "data:") {
-			continue
-		}
-		_payloadText := strings.TrimSpace(strings.TrimPrefix(_line, "data:"))
-		if _payloadText == "" || _payloadText == "[DONE]" {
-			continue
-		}
+	for _, frame := range ParseSSEDataFrames(_event) {
 		var _payload map[string]interface{}
-		if _err := json.Unmarshal([]byte(_payloadText), &_payload); _err != nil {
+		if _err := json.Unmarshal([]byte(frame.Data), &_payload); _err != nil {
 			continue
 		}
-		switch strings.TrimSpace(stringFromAny(_payload["type"])) {
+		kind := strings.TrimSpace(stringFromAny(_payload["type"]))
+		if kind == "" {
+			kind = frame.Event
+		}
+		switch kind {
 		case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
 			return true
 		}
@@ -2731,17 +2738,9 @@ func streamEventHasResponsesTerminalEvent(_event string) bool {
 
 // -------------------------------------------------------------------------------------
 func streamEventHasFinishReason(_event string) bool {
-	for _, _line := range strings.Split(_event, "\n") {
-		_line = strings.TrimSpace(_line)
-		if !strings.HasPrefix(_line, "data:") {
-			continue
-		}
-		_payloadText := strings.TrimSpace(strings.TrimPrefix(_line, "data:"))
-		if _payloadText == "" || _payloadText == "[DONE]" {
-			continue
-		}
+	for _, frame := range ParseSSEDataFrames(_event) {
 		var _payload map[string]interface{}
-		if _err := json.Unmarshal([]byte(_payloadText), &_payload); _err != nil {
+		if _err := json.Unmarshal([]byte(frame.Data), &_payload); _err != nil {
 			continue
 		}
 		_choices, _ok := _payload["choices"].([]interface{})
@@ -3642,8 +3641,8 @@ func estimateTokensFromCounts(_chineseChars int, _otherChars int) int {
 }
 
 // -------------------------------------------------------------------------------------
-func flushResponse(_w http.ResponseWriter) {
-	_ = FlushResponseWriter(_w)
+func flushResponse(_w http.ResponseWriter) error {
+	return DownstreamError(FlushResponseWriter(_w))
 }
 
 // -------------------------------------------------------------------------------------

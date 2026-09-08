@@ -3316,7 +3316,7 @@ func (_h *HTTPAPI) handleResponsesRawProxy(_w http.ResponseWriter, _r *http.Requ
 	_h.applyLowReasoningDemotion(_r, &_selectionReq)
 	_h.refreshConversationBindings()
 	_started := time.Now()
-	_target, _model, _profile, _selectionMeta, _err := _h.Balancer.Select(&_selectionReq)
+	_target, _model, _profile, _selectionMeta, _err := _h.Balancer.Acquire(&_selectionReq)
 	if _err != nil {
 		_ = history.RecordChat(history.RecordFromSelection(_started, time.Now(), _selectionReq, nil, nil, _profile, _selectionMeta, false, _err))
 		_h.writeSelectionUnavailable(_w, _r, _err)
@@ -3324,8 +3324,7 @@ func (_h *HTTPAPI) handleResponsesRawProxy(_w http.ResponseWriter, _r *http.Requ
 	}
 
 	noteKeyRequestComplexity(_r, _profile, _requestSignals)
-	_target.StartRequest()
-	defer _target.FinishRequest()
+	defer _target.RequestRelease()()
 
 	_timeout := time.Duration(_target.Config.TimeoutSeconds) * time.Second
 	if _timeout <= 0 {
@@ -3424,8 +3423,9 @@ func startRetryKeepalive(_ctx context.Context, _deferred *deferredResponseWriter
 			}
 		}
 	}()
+	var stopOnce sync.Once
 	return func() {
-		close(_stop)
+		stopOnce.Do(func() { close(_stop) })
 		<-_done
 	}
 }
@@ -3444,26 +3444,36 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_maxRetries = pinnedProviderMaxRetries
 	}
 	_reconnectKey, _ := _r.Context().Value(reconnectIdentityKey{}).(string)
-	_shared, _rejection := _h.reconnectBudgets.acquire(_reconnectKey, _maxRetries+1)
+	_retrySettings := _h.currentAdvancedSettings()
+	_headersSent, _ := _r.Context().Value(turnGateHeadersKey{}).(bool)
+	_budgetWriter := newDeferredResponseWriter(_w, _request.Stream)
+	if _headersSent {
+		_budgetWriter.AdoptCommitted()
+	}
+	_budgetHeartbeat := _heartbeat
+	if !_request.Stream {
+		_budgetHeartbeat = nil
+	}
+	_shared, _rejection, _acquireErr := _h.acquireReconnectBudget(_r.Context(), _reconnectKey, _maxRetries+1, _budgetWriter, _budgetHeartbeat, time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second, _trace)
+	_headersSent = _headersSent || _budgetWriter.Committed()
+	if _acquireErr != nil {
+		log.Printf("provider replay wait stopped: trace=%s error=%v", _trace, _acquireErr)
+		return
+	}
 	if _rejection != nil {
 		if _rejection.retryAfter > 0 {
 			_w.Header().Set("Retry-After", strconv.Itoa(_rejection.retryAfter))
 		}
 		log.Printf("provider replay blocked: trace=%s reason=%s", _trace, _rejection.code)
-		_rejectionWriter := newDeferredResponseWriter(_w, _request.Stream)
-		_gateHeaders, _ := _r.Context().Value(turnGateHeadersKey{}).(bool)
-		if _gateHeaders {
-			_rejectionWriter.AdoptCommitted()
-		}
-		// 額度用盡是代理的節流決定，不是上游故障。送 response.failed 會讓客戶端
-		// 判定回合中斷（Codex 顯示 stream disconnected before completion）並立刻重連，
-		// 反而把節流變成更吵的重試。改用「完成」型終止事件把原因當成助理訊息交付，
-		// agent 讀得到「請在 N 秒後重試」而不是崩潰。
+		// 暫時節流不能偽裝成完成，Agent 不會因助理文字中的等待秒數自行重送。
+		// 只有工具防重播屬於必須停下來處理的通知；其他情況保留失敗語意。
 		_terminal := _refusalTerminal
-		if (_rejection.code == "request_retry_exhausted" || _rejection.code == "request_replay_unsafe") && _throttleTerminal != nil {
+		_localNotice := _rejection.code == "request_replay_unsafe"
+		if _localNotice && _throttleTerminal != nil {
 			_terminal = _throttleTerminal
 		}
-		if (_rejection.code == "request_retry_exhausted" || _rejection.code == "request_replay_unsafe" || _gateHeaders) && _h.writeGracefulStreamTerminal(_w, _rejectionWriter, _request.Stream, _terminal, errors.New(_rejection.message)) {
+		if _request.Stream && (_localNotice || _headersSent) {
+			_h.writeGracefulStreamTerminal(_w, _budgetWriter, true, _terminal, errors.New(_rejection.message))
 			return
 		}
 		_h.writeJSON(_w, _rejection.status, domain.ErrorResponse(_rejection.code, _rejection.message))
@@ -3473,6 +3483,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	defer func() { _h.reconnectBudgets.release(_reconnectKey, _shared, _success) }()
 	if _shared != nil {
 		_maxRetries = _shared.limit - _shared.attempts - 1
+		_maxRetries = min(_maxRetries, max(3, _shared.limit)-_shared.probeAttempts-1)
 		if _shared.rebindFrom != "" {
 			if _h.conversationPinIsReleasable(_r) && _releaseContinuity != nil && _releaseContinuity(_shared.rebindFrom) {
 				_request.ProviderID, _request.Provider = "", ""
@@ -3484,7 +3495,12 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		}
 		if _shared.provider != "" {
 			if (_request.ProviderID != "" && _request.ProviderID != _shared.provider) || (_request.Provider != "" && _request.Provider != _shared.provider) {
-				_h.writeJSON(_w, http.StatusBadRequest, domain.ErrorResponse("request_route_conflict", "重連請求與原 Provider 不一致，未送往上游"))
+				_routeErr := errors.New("重連請求與原 Provider 不一致，未送往上游")
+				if _headersSent && _request.Stream {
+					_h.writeGracefulStreamTerminal(_w, _budgetWriter, true, _refusalTerminal, _routeErr)
+				} else {
+					_h.writeJSON(_w, http.StatusBadRequest, domain.ErrorResponse("request_route_conflict", _routeErr.Error()))
+				}
 				return
 			}
 			_request.ProviderID, _request.Provider, _request.Model = _shared.provider, _shared.provider, _shared.model
@@ -3495,7 +3511,6 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 
 	_complexityRecorded := false
 	// 保活心跳送出後 header 就已經出去了，後續嘗試的 writer 必須承接這個狀態。
-	_headersSent, _ := _r.Context().Value(turnGateHeadersKey{}).(bool)
 	var _lastErr error
 	var _lastDeferred *deferredResponseWriter
 	_waitedForCooldown := time.Duration(0)
@@ -3504,16 +3519,20 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	if _shared != nil {
 		_waitedForCooldown = _shared.waited
 		_waitedForAdmission = _shared.admissionWaited
-		_hasDispatched = _shared.attempts > 0
+		_hasDispatched = _shared.probeAttempts > 0 || _shared.attempts > 0
 	}
-	_retrySettings := _h.currentAdvancedSettings()
 	_budget := providerRetryBudget{maxRounds: _retrySettings.ProviderRetryRounds, maxSources: _retrySettings.ProviderRetrySourcesPerRound}
 	if _shared != nil {
 		_budget.used = append([]string(nil), _shared.usedProviders...)
+		_budget.round = _shared.round
 	}
 
 	for _attempt := 0; _attempt <= _maxRetries; _attempt++ {
 		_target, _model, _profile, _selectionMeta, _err := _h.selectRetryProvider(&_request, &_budget)
+		if _shared != nil {
+			_shared.round = _budget.round
+			_shared.usedProviders = append([]string(nil), _budget.used...)
+		}
 		_lastPolicy := proxy.ClassifyFailure(_lastErr)
 		if _err != nil && (_lastErr == nil || _lastPolicy.Capacity || _lastPolicy.RetryableServer) {
 			if _err != nil && _r.Context().Err() == nil {
@@ -3585,6 +3604,9 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 			return
 		}
 
+		_releaseSlot := _target.RequestRelease()
+		defer _releaseSlot()
+
 		if !_complexityRecorded {
 			// 只在第一次成功選擇時記錄：重試是同一個請求，不該重複計數。
 			noteKeyRequestComplexity(_r, _profile, _signals)
@@ -3601,18 +3623,22 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 			_shared.rebindFrom = ""
 			_shared.usedProviders = append(append([]string(nil), _budget.used...), _target.Config.ID)
 			_shared.attempts++
+			if _shared.probeWindowAt.IsZero() {
+				_shared.probeWindowAt = time.Now()
+			}
+			_shared.probeAttempts++
 			log.Printf("provider replay budget: trace=%s attempt=%d limit=%d waited=%s", _trace, _shared.attempts, _shared.limit, _shared.waited)
 		}
 		_pinnedProvider = true
 		_attemptStarted := time.Now()
 		_budget.used = append(_budget.used, _target.Config.ID)
 		log.Printf("provider attempt: provider=%q model=%q attempt=%d round=%d trace=%s", _target.Config.ID, _model.Name, _attempt+1, _budget.round, _trace)
-		_target.StartRequest()
 		_timeout := time.Duration(_target.Config.TimeoutSeconds) * time.Second
 		if _timeout <= 0 {
 			_timeout = time.Duration(domain.DefaultProviderTimeoutSeconds) * time.Second
 		}
 		_ctx, _cancel := requestForwardContext(_r.Context(), _timeout, _request.Stream)
+		defer _cancel()
 		_deferred := newDeferredResponseWriter(_w, _request.Stream)
 		if _headersSent {
 			_deferred.AdoptCommitted()
@@ -3620,6 +3646,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		// 保活必須涵蓋整個嘗試：上游過載時要 1.5～4 秒才回錯誤，
 		// 那段期間內建心跳照不到（還沒有上游串流可監看）。
 		_stopKeepalive := startRetryKeepalive(_ctx, _deferred, _request.Stream, _heartbeat, _cancel)
+		defer _stopKeepalive()
 		_metrics, _forwardErr := _forward(_ctx, _deferred, _target, _model, _profile, _selectionMeta)
 		_stopKeepalive()
 		_cancel()
@@ -3632,7 +3659,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		if _deferred.Committed() {
 			_headersSent = true
 		}
-		_target.FinishRequest()
+		_releaseSlot()
 		_attemptDuration := time.Since(_attemptStarted)
 		log.Printf("provider attempt result: trace=%s provider=%q model=%q attempt=%d elapsed=%s failed=%t delivered=%t first_commit=%q content_items=%d upstream_request_id=%q",
 			_trace, _target.Config.ID, _model.Name, _attempt+1, _attemptDuration.Round(time.Millisecond), _forwardErr != nil,
@@ -3847,6 +3874,10 @@ func (_h *HTTPAPI) providerRetryCount() int {
 
 // -------------------------------------------------------------------------------------
 func providerFailureCanRetryBeforeFirstToken(_err error, _deferred *deferredResponseWriter) bool {
+	var downstream *proxy.DownstreamWriteError
+	if errors.As(_err, &downstream) {
+		return false
+	}
 	if errors.Is(_err, errResponseBufferLimit) {
 		return false
 	}
@@ -4210,15 +4241,14 @@ func (_h *HTTPAPI) handleMultimodalProxy(_w http.ResponseWriter, _r *http.Reques
 
 	_h.refreshConversationBindings()
 	_started := time.Now()
-	_target, _model, _profile, _selectionMeta, _err := _h.Balancer.Select(&_selectionReq)
+	_target, _model, _profile, _selectionMeta, _err := _h.Balancer.Acquire(&_selectionReq)
 	if _err != nil {
 		_h.writeSelectionUnavailable(_w, _r, _err)
 		return
 	}
 
 	noteKeyRequestComplexity(_r, _profile)
-	_target.StartRequest()
-	defer _target.FinishRequest()
+	defer _target.RequestRelease()()
 
 	_timeout := time.Duration(_target.Config.TimeoutSeconds) * time.Second
 	if _timeout <= 0 {
@@ -4287,6 +4317,10 @@ func (_h *HTTPAPI) pinnedRoutingUnavailableReason(_r *http.Request) string {
 
 // -------------------------------------------------------------------------------------
 func recordProviderForwardFailure(_provider *balancer.ProviderRuntime, _err error, _request *http.Request, _latency time.Duration, _capacityCooldown time.Duration, _serverCooldown time.Duration, _models ...string) {
+	var downstream *proxy.DownstreamWriteError
+	if errors.As(_err, &downstream) {
+		return
+	}
 	if errors.Is(_err, errResponseBufferLimit) {
 		return
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"LoadBalanceProvider/src/proxy"
+	bolt "go.etcd.io/bbolt"
 )
 
 // 僅持久化來源與帳號指紋；不保存訊息、工具參數、token 或原始對話識別。
@@ -76,24 +77,40 @@ func (h *HTTPAPI) bindingFingerprint(provider string) string {
 }
 
 func (h *HTTPAPI) lookupDurableTurnRoute(route, owner string) (proxy.ResponseRouteTarget, bool, error) {
-	if target, ok := h.Client.LookupResponseRouteForOwner(route, owner); ok {
-		return target, true, nil
-	}
+	cached, cachedOK := h.Client.LookupResponseRouteForOwner(route, owner)
 	turnBindingFileLock.Lock()
 	defer turnBindingFileLock.Unlock()
-	entries, err := h.readTurnBindings()
+	var entry savedTurnBinding
+	var ok bool
+	err := h.withTurnDB(func(db *bolt.DB) error {
+		return db.View(func(tx *bolt.Tx) error {
+			var err error
+			entry, ok, err = readRouteEntry(tx, routeBucket(route), turnBindingDiskKey(route, owner))
+			return err
+		})
+	})
 	if err != nil {
 		return proxy.ResponseRouteTarget{}, false, turnError("無法讀取持久化回合綁定，請檢查綁定檔")
 	}
-	entry, ok := entries[turnBindingDiskKey(route, owner)]
 	if !ok {
+		// 未曾持久化的舊版快照仍可接續；已保存但到期的配對不可被快取復活。
+		if entry.Until.IsZero() && cachedOK && !cached.Persisted {
+			return cached, true, nil
+		}
 		return proxy.ResponseRouteTarget{}, false, nil
 	}
 	if h.bindingFingerprint(entry.Provider) != entry.Fingerprint {
 		return proxy.ResponseRouteTarget{}, false, turnError("原 Provider 的帳號已變更，不能接續既有回合")
 	}
-	target := proxy.ResponseRouteTarget{ProviderID: entry.Provider, Model: entry.Model, Owner: owner, CreatedAt: time.Now()}
+	// 持久化來源是依據，但有效的記憶體快照仍保留完整歷史供安全接續。
+	if cachedOK && cached.ProviderID == entry.Provider && cached.Model == entry.Model {
+		cached.Persisted = true
+		h.Client.MarkResponseRoutePersisted(route, cached)
+		return cached, true, nil
+	}
+	target := proxy.ResponseRouteTarget{ProviderID: entry.Provider, Model: entry.Model, Owner: owner, CreatedAt: time.Now(), Persisted: true}
 	h.Client.RecordPromptCacheRoute(route, target.ProviderID, target.Model, owner)
+	h.Client.MarkResponseRoutePersisted(route, target)
 	return target, true, nil
 }
 
@@ -103,55 +120,42 @@ func (h *HTTPAPI) saveTurnRoutes(routes map[string]proxy.ResponseRouteTarget) er
 	}
 	turnBindingFileLock.Lock()
 	defer turnBindingFileLock.Unlock()
-	entries, err := h.readTurnBindings()
-	if err != nil {
-		return err
-	}
-	for route, target := range routes {
-		fingerprint := h.bindingFingerprint(target.ProviderID)
-		if fingerprint == "" {
-			return fmt.Errorf("無法確認原 Provider 帳號身分")
+	err := h.withTurnDB(func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			if err := pruneTurnDB(tx); err != nil {
+				return err
+			}
+			for route, target := range routes {
+				fingerprint := h.bindingFingerprint(target.ProviderID)
+				if fingerprint == "" {
+					return fmt.Errorf("無法確認原 Provider 帳號身分")
+				}
+				bucket, key := routeBucket(route), turnBindingDiskKey(route, target.Owner)
+				old, ok, err := readRouteEntry(tx, bucket, key)
+				if err != nil {
+					return err
+				}
+				if ok && (old.Provider != target.ProviderID || old.Model != target.Model || old.Fingerprint != fingerprint) {
+					return fmt.Errorf("持久化來源綁定衝突")
+				}
+				ttl := 30 * 24 * time.Hour
+				if string(bucket) == "responses" {
+					ttl = 7 * 24 * time.Hour
+				}
+				if ok && time.Until(old.Until) > ttl-time.Hour {
+					continue
+				}
+				if err = putRouteEntry(tx, bucket, key, savedTurnBinding{target.ProviderID, target.Model, fingerprint, time.Now().Add(ttl)}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+	if err == nil {
+		for route, target := range routes {
+			h.Client.MarkResponseRoutePersisted(route, target)
 		}
-		key := turnBindingDiskKey(route, target.Owner)
-		if old, ok := entries[key]; ok && (old.Provider != target.ProviderID || old.Model != target.Model || old.Fingerprint != fingerprint) {
-			return fmt.Errorf("持久化來源綁定衝突")
-		}
-		entries[key] = savedTurnBinding{Provider: target.ProviderID, Model: target.Model, Fingerprint: fingerprint, Until: time.Now().Add(30 * 24 * time.Hour)}
 	}
-	return h.writeTurnBindings(entries)
-}
-
-// 呼叫端持有 turnBindingFileLock。
-func (h *HTTPAPI) writeTurnBindings(entries map[string]savedTurnBinding) error {
-	// 不淘汰仍有效的綁定來容納新回合，以免既有工具流程失去來源。
-	if len(entries) > 10000 {
-		return fmt.Errorf("持久化回合綁定已達容量上限")
-	}
-	data, err := json.Marshal(entries)
-	if err != nil {
-		return err
-	}
-	if len(data) > 4*1024*1024 {
-		return fmt.Errorf("回合綁定檔超過大小限制")
-	}
-	path := h.turnBindingPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".turn-bindings-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(data); err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return os.Rename(f.Name(), path)
+	return err
 }

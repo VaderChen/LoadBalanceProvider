@@ -88,7 +88,7 @@ func (h *HTTPAPI) bindTurnBeforeDispatch(key string, r *http.Request, provider, 
 	if key == "" {
 		return nil
 	}
-	target := proxy.ResponseRouteTarget{ProviderID: provider, Model: model, Owner: proxy.ResponseRouteOwner(r)}
+	target := proxy.ResponseRouteTarget{ProviderID: provider, Model: model, Owner: proxy.ResponseRouteOwner(r), Persisted: true}
 	routes := map[string]proxy.ResponseRouteTarget{key: target}
 	if recovered, _ := r.Context().Value(turnRecoveryContextKey{}).(bool); recovered {
 		routes["recovered:"+key] = target

@@ -84,7 +84,7 @@ func TestRecorderUsesStartEndBoundariesAndAvoidsNegativeUsageAfterReset(t *testi
 		{false, _dayOneEnd, 72},
 		{true, _dayTwoStart, 72},
 		{false, _dayTwoEnd, 88},   // Quota reset during the day: 72 - 88 must become 0.
-		{false, _dayThreeEnd, 40}, // Missing start boundary defaults to 100.
+		{false, _dayThreeEnd, 40}, // 缺少日初基準，不推測已消耗 60%。
 	} {
 		var _err error
 		if _record.start {
@@ -115,8 +115,8 @@ func TestRecorderUsesStartEndBoundariesAndAvoidsNegativeUsageAfterReset(t *testi
 	if _usageByDate["2026-08-02"] != 0 {
 		t.Fatalf("August 2 usage = %.1f, want 0.0 after quota reset", _usageByDate["2026-08-02"])
 	}
-	if _usageByDate["2026-08-03"] != 60 {
-		t.Fatalf("August 3 usage = %.1f, want 60.0 with missing start treated as 100", _usageByDate["2026-08-03"])
+	if _usageByDate["2026-08-03"] != 0 {
+		t.Fatalf("缺少基準卻回填消耗: %.1f", _usageByDate["2026-08-03"])
 	}
 }
 
@@ -177,16 +177,18 @@ func TestRecorderAccumulatesUsageAcrossSameDayQuotaReset(t *testing.T) {
 	_recorder := NewRecorder(filepath.Join(t.TempDir(), "provider_usage"))
 	_start := time.Date(2026, time.August, 11, 0, 0, 0, 0, time.Local)
 
-	if _err := _recorder.RecordDayStart("provider-a", 100, _start); _err != nil {
+	context := ObservationContext{Series: "account:api:window", ResetAt: _start.Add(10 * time.Hour).Unix()}
+	if _err := _recorder.RecordBoundaryObservation("provider-a", 100, _start, _start, context, true); _err != nil {
 		t.Fatalf("record day start: %v", _err)
 	}
-	if _err := _recorder.Record("provider-a", 20, 80, _start.Add(8*time.Hour)); _err != nil {
+	if _err := _recorder.RecordObservation("provider-a", 20, 80, _start.Add(8*time.Hour), context); _err != nil {
 		t.Fatalf("record first live usage: %v", _err)
 	}
-	if _err := _recorder.Record("provider-a", 10, 90, _start.Add(12*time.Hour)); _err != nil {
+	context.ResetAt = _start.Add(24 * time.Hour).Unix()
+	if _err := _recorder.RecordObservation("provider-a", 10, 90, _start.Add(12*time.Hour), context); _err != nil {
 		t.Fatalf("record reset live usage: %v", _err)
 	}
-	if _err := _recorder.Record("provider-a", 25, 75, _start.Add(16*time.Hour)); _err != nil {
+	if _err := _recorder.RecordObservation("provider-a", 25, 75, _start.Add(16*time.Hour), context); _err != nil {
 		t.Fatalf("record usage after reset: %v", _err)
 	}
 
@@ -205,13 +207,15 @@ func TestRecorderPreservesAccumulatedUsageAcrossReloadAndMultipleResets(t *testi
 	_start := time.Date(2026, time.August, 12, 0, 0, 0, 0, time.Local)
 	_recorder := NewRecorder(_root)
 
-	if _err := _recorder.RecordDayStart("provider-a", 100, _start); _err != nil {
+	context := ObservationContext{Series: "account:api:window", ResetAt: _start.Add(5 * time.Hour).Unix()}
+	if _err := _recorder.RecordBoundaryObservation("provider-a", 100, _start, _start, context, true); _err != nil {
 		t.Fatalf("record day start: %v", _err)
 	}
-	if _err := _recorder.Record("provider-a", 20, 80, _start.Add(4*time.Hour)); _err != nil {
+	if _err := _recorder.RecordObservation("provider-a", 20, 80, _start.Add(4*time.Hour), context); _err != nil {
 		t.Fatalf("record first segment: %v", _err)
 	}
-	if _err := _recorder.Record("provider-a", 0, 100, _start.Add(5*time.Hour)); _err != nil {
+	context.ResetAt = _start.Add(10 * time.Hour).Unix()
+	if _err := _recorder.RecordObservation("provider-a", 0, 100, _start.Add(5*time.Hour), context); _err != nil {
 		t.Fatalf("record first reset: %v", _err)
 	}
 	if _err := _recorder.Flush(); _err != nil {
@@ -219,13 +223,14 @@ func TestRecorderPreservesAccumulatedUsageAcrossReloadAndMultipleResets(t *testi
 	}
 
 	_reloaded := NewRecorder(_root)
-	if _err := _reloaded.Record("provider-a", 10, 90, _start.Add(8*time.Hour)); _err != nil {
+	if _err := _reloaded.RecordObservation("provider-a", 10, 90, _start.Add(8*time.Hour), context); _err != nil {
 		t.Fatalf("record second segment: %v", _err)
 	}
-	if _err := _reloaded.Record("provider-a", 0, 100, _start.Add(10*time.Hour)); _err != nil {
+	context.ResetAt = _start.Add(15 * time.Hour).Unix()
+	if _err := _reloaded.RecordObservation("provider-a", 0, 100, _start.Add(10*time.Hour), context); _err != nil {
 		t.Fatalf("record second reset: %v", _err)
 	}
-	if _err := _reloaded.Record("provider-a", 5, 95, _start.Add(12*time.Hour)); _err != nil {
+	if _err := _reloaded.RecordObservation("provider-a", 5, 95, _start.Add(12*time.Hour), context); _err != nil {
 		t.Fatalf("record third segment: %v", _err)
 	}
 

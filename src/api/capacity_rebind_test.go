@@ -101,7 +101,7 @@ func TestCapacityRebindSafetyAndPersistence(t *testing.T) {
 	}
 }
 
-func TestExhaustedReplayUsesProtocolTerminal(t *testing.T) {
+func TestExhaustedReplayWithoutWaitReturnsRetryableStatus(t *testing.T) {
 	for _, stream := range []bool{true, false} {
 		h := capacityTestHandler(t)
 		r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -118,23 +118,9 @@ func TestExhaustedReplayUsesProtocolTerminal(t *testing.T) {
 		if w.Header().Get("Retry-After") == "" || !entry.retryAt.Equal(deadline) {
 			t.Fatal("cooldown header missing or blocked replay extended deadline")
 		}
-		// 節流不是上游故障：送 response.failed 會讓 Codex 判定回合中斷
-		// （顯示 stream disconnected before completion）並立刻重連，
-		// 等於把節流變成更吵的重試。必須以「完成」型終止事件交付原因。
-		if stream {
-			body := w.Body.String()
-			if w.Code != 200 || !strings.Contains(body, "response.completed") {
-				t.Fatalf("stream retry budget returned hard error: %d %s", w.Code, body)
-			}
-			if strings.Contains(body, "response.failed") {
-				t.Fatalf("throttling must not be reported as an upstream failure: %s", body)
-			}
-			if !strings.Contains(body, "秒後重試") {
-				t.Fatalf("client cannot read the throttle reason: %s", body)
-			}
-		}
-		if !stream && w.Code != 429 {
-			t.Fatalf("non-stream retry budget status=%d", w.Code)
+		// 設定不等待且尚未送出心跳時，節流必須保留可重試的 HTTP 狀態。
+		if w.Code != http.StatusTooManyRequests || !strings.Contains(w.Body.String(), "request_retry_exhausted") || strings.Contains(w.Body.String(), "response.completed") {
+			t.Fatalf("節流被當成完成: stream=%t status=%d body=%s", stream, w.Code, w.Body.String())
 		}
 		entry.retryAt = time.Now().Add(-time.Second)
 		probe, rejection := h.reconnectBudgets.acquire(key, 2)

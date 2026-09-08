@@ -58,12 +58,20 @@ type reconnectBudget struct {
 	rebindFrom      string
 	usedProviders   []string
 	delivered       bool
+	probeAttempts   int
+	probeWindowAt   time.Time
+	round           int
 }
 
 type reconnectRejection struct {
 	status        int
 	retryAfter    int
 	code, message string
+	retryAt       time.Time
+}
+
+func (r *reconnectRejection) canWaitForRecovery() bool {
+	return r != nil && !r.retryAt.IsZero() && (r.code == "request_retry_exhausted" || r.code == "request_probe_throttled")
 }
 
 func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget, *reconnectRejection) {
@@ -80,13 +88,26 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 	}
 	entry := s.entries[key]
 	if entry != nil && entry.active {
-		return nil, &reconnectRejection{http.StatusTooManyRequests, 3, "request_in_progress", "相同請求仍在處理，未重複送往上游"}
+		return nil, &reconnectRejection{status: http.StatusTooManyRequests, retryAfter: 3, code: "request_in_progress", message: "相同請求仍在處理，未重複送往上游"}
 	}
 	if entry != nil {
 		if entry.delivered {
-			return nil, &reconnectRejection{http.StatusBadRequest, 0, "request_replay_unsafe", "此請求已交付完整工具呼叫後中斷，不自動重播；請確認工具結果並提出新的接續請求"}
+			return nil, &reconnectRejection{status: http.StatusBadRequest, code: "request_replay_unsafe", message: "此請求已交付完整工具呼叫後中斷，不自動重播；請確認工具結果並提出新的接續請求"}
 		}
 		entry.limit = min(entry.limit, limit)
+		// 退款不清除實際探測紀錄；短窗口結束後再放行，不延長既定期限。
+		if !entry.probeWindowAt.IsZero() && !now.Before(entry.probeWindowAt.Add(reconnectRetryCooldown)) {
+			entry.probeAttempts = 0
+			entry.probeWindowAt = time.Time{}
+			entry.usedProviders = nil
+			entry.round = 0
+			entry.waited, entry.admissionWaited = 0, 0
+		}
+		if entry.probeAttempts >= max(3, entry.limit) {
+			retryAt := entry.probeWindowAt.Add(reconnectRetryCooldown)
+			seconds := int((retryAt.Sub(now) + time.Second - 1) / time.Second)
+			return nil, &reconnectRejection{status: http.StatusTooManyRequests, retryAfter: seconds, retryAt: retryAt, code: "request_probe_throttled", message: fmt.Sprintf("容量恢復探測暫停；請在 %d 秒後重試，上游較長的冷卻仍須等待", seconds)}
+		}
 		if entry.attempts >= entry.limit {
 			// 已允許重新選路時略過代理冷卻；實際來源仍須通過選路與上游冷卻檢查。
 			if entry.rebindFrom != "" {
@@ -96,7 +117,7 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 			}
 			if now.Before(entry.retryAt) {
 				seconds := int((entry.retryAt.Sub(now) + time.Second - 1) / time.Second)
-				return nil, &reconnectRejection{http.StatusTooManyRequests, seconds, "request_retry_exhausted", fmt.Sprintf("代理上游嘗試額度（%d 次）已用盡，與用戶端重連次數分開計算；請在 %d 秒後重試，上游較長的冷卻仍須等待", entry.limit, seconds)}
+				return nil, &reconnectRejection{status: http.StatusTooManyRequests, retryAfter: seconds, retryAt: entry.retryAt, code: "request_retry_exhausted", message: fmt.Sprintf("代理上游嘗試額度（%d 次）已用盡，與用戶端重連次數分開計算；請在 %d 秒後重試，上游較長的冷卻仍須等待", entry.limit, seconds)}
 			}
 			// 冷卻後只增加一次探測機會，不重新發放整套內部重試額度。
 			entry.attempts = entry.limit - 1
@@ -105,13 +126,16 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 		}
 	} else {
 		if len(s.entries) >= reconnectEntryLimit {
-			return nil, &reconnectRejection{http.StatusServiceUnavailable, 3, "retry_tracker_full", "重試追蹤容量已滿，請稍後再試"}
+			return nil, &reconnectRejection{status: http.StatusServiceUnavailable, retryAfter: 3, code: "retry_tracker_full", message: "重試追蹤容量已滿，請稍後再試"}
 		}
 		if s.entries == nil {
 			s.entries = make(map[string]*reconnectBudget)
 		}
 		entry = &reconnectBudget{limit: limit}
 		s.entries[key] = entry
+	}
+	if entry.probeWindowAt.IsZero() {
+		entry.probeWindowAt = now
 	}
 	entry.active = true
 	return entry, nil
@@ -123,7 +147,7 @@ func (s *reconnectBudgetStore) release(key string, entry *reconnectBudget, succe
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if success || (entry.attempts == 0 && entry.admissionWaited == 0) {
+	if success || (entry.attempts == 0 && entry.probeAttempts == 0 && entry.admissionWaited == 0) {
 		delete(s.entries, key)
 		return
 	}

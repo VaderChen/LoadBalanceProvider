@@ -43,23 +43,35 @@ func waitForProviderCooldown(ctx context.Context, writer *deferredResponseWriter
 	if wait > budget {
 		return 0, false
 	}
-	started := time.Now()
-	if err := writer.WriteStreamHeartbeat(heartbeat); err != nil {
-		return 0, false
+	elapsed, err := waitWithStreamHeartbeat(ctx, writer, heartbeat, wait)
+	return elapsed, err == nil
+}
+
+// 只維持下游連線，不保留 Provider 名額；取消或寫入失敗立即停止等待。
+func waitWithStreamHeartbeat(ctx context.Context, writer *deferredResponseWriter, heartbeat []byte, wait time.Duration) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
+	if wait <= 0 {
+		return 0, nil
+	}
+	started := time.Now()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
+	if err := writer.WriteStreamHeartbeat(heartbeat); err != nil {
+		return time.Since(started), err
+	}
 	ticker := time.NewTicker(providerRetryKeepaliveInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return time.Since(started), false
+			return time.Since(started), ctx.Err()
 		case <-timer.C:
-			return time.Since(started), true
+			return time.Since(started), ctx.Err()
 		case <-ticker.C:
 			if err := writer.WriteStreamHeartbeat(heartbeat); err != nil {
-				return time.Since(started), false
+				return time.Since(started), err
 			}
 		}
 	}

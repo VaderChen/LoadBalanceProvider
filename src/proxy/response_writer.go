@@ -6,6 +6,22 @@ import (
 	"time"
 )
 
+type DownstreamWriteError struct{ Err error }
+
+func (e *DownstreamWriteError) Error() string { return "下游回應交付失敗: " + e.Err.Error() }
+func (e *DownstreamWriteError) Unwrap() error { return e.Err }
+
+func DownstreamError(err error) error {
+	if err == nil || errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	var existing *DownstreamWriteError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &DownstreamWriteError{Err: err}
+}
+
 // 優先保留各包裝層的行為；舊版 SDK 沒有 Unwrap 時，沿既有嵌入欄位尋找。
 func responseWriterOperation(w http.ResponseWriter, operation func(http.ResponseWriter) error) error {
 	for depth := 0; w != nil && depth < 64; depth++ {

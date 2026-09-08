@@ -15,8 +15,12 @@ func TestQuotaResetDetails(t *testing.T) {
 		}
 	}
 	d := failureDetailsFromPayload(map[string]interface{}{"type": "usage_limit_reached", "resets_at": now.Add(time.Hour).Unix(), "resets_in_seconds": 60, "retry_after": 120}, now)
-	if d.RetryAfter != 2*time.Minute || !d.QuotaResetAt.Equal(now.Add(time.Hour)) {
+	if d.RetryAfter != time.Hour || !d.QuotaResetAt.Equal(now.Add(time.Hour)) {
 		t.Fatalf("reset precedence: %+v", d)
+	}
+	d = failureDetailsFromPayload(map[string]interface{}{"type": "usage_limit_reached", "resets_at": now.Add(time.Hour).Unix(), "retry_after": 7200}, now)
+	if d.RetryAfter != 2*time.Hour || !d.QuotaResetAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("較長的 Retry-After 不可被額度重設時間縮短: %+v", d)
 	}
 	d = failureDetailsFromPayload(map[string]interface{}{"type": "rate_limit_exceeded", "resets_in_seconds": 172800}, now)
 	if !d.QuotaResetAt.IsZero() {

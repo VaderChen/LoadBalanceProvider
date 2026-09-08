@@ -39,9 +39,20 @@ func EnrichFailure(err error, body string) {
 	details := failureDetailsFromPayload(payload, time.Now())
 	status.Type = details.Type
 	status.QuotaResetAt = details.QuotaResetAt
-	if status.RetryAfter <= 0 {
+	if details.RetryAfter > status.RetryAfter {
 		status.RetryAfter = details.RetryAfter
 	}
+}
+
+// SSE 本文可能不帶等待提示，仍須保留 HTTP 標頭要求的較長冷卻。
+func retainStreamRetryAfter(err error, header http.Header) error {
+	var stream *ProviderStreamError
+	if errors.As(err, &stream) {
+		if wait := retryAfterHeader(header); wait > stream.RetryAfter {
+			stream.RetryAfter = wait
+		}
+	}
+	return err
 }
 
 func failureDetailsFromEvent(event string) FailureDetails {
@@ -84,7 +95,7 @@ func failureDetailsFromPayload(payload map[string]interface{}, now time.Time) Fa
 	} else if n := seconds(payload["resets_in_seconds"]); n > 0 && n <= maxQuotaWait.Seconds() {
 		d.QuotaResetAt = now.Add(time.Duration(n * float64(time.Second)))
 	}
-	if d.RetryAfter <= 0 && d.QuotaResetAt.After(now) {
+	if d.QuotaResetAt.After(now) && d.QuotaResetAt.Sub(now) > d.RetryAfter {
 		d.RetryAfter = d.QuotaResetAt.Sub(now)
 	}
 	return d

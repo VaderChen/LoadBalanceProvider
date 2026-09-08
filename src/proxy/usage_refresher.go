@@ -19,7 +19,7 @@ import (
 	"LoadBalanceProvider/src/security"
 )
 
-const providerUsageRefreshInterval = 3 * time.Minute
+const providerUsageRefreshInterval = 30 * time.Second
 const providerUsageStaleThreshold = 10 * time.Minute
 const providerUsageRefreshConcurrency = 4
 
@@ -101,10 +101,16 @@ func (_c *Client) refreshProviderUsageForProvider(_ctx context.Context, _provide
 	defer _cancel()
 
 	if isOpenAICodexProvider(_provider) && strings.TrimSpace(providerAPIKey(_provider)) == "" {
-		if !_force && !_provider.ShouldProbeAccountUsage(time.Now(), providerUsageStaleThreshold) {
+		if !_provider.BeginAccountUsageProbe(time.Now(), _force) {
+			if _force {
+				return fmt.Errorf("帳號用量查詢已在進行中")
+			}
 			return nil
 		}
-		return _c.refreshOpenAICodexOAuthUsage(_ctx, _provider)
+		err := fmt.Errorf("帳號用量查詢未完成")
+		defer func() { _provider.EndAccountUsageProbe(err) }()
+		err = _c.refreshOpenAICodexOAuthUsage(_ctx, _provider)
+		return err
 	}
 	if !_force && !_provider.ShouldProbeUsage(time.Now(), providerUsageStaleThreshold) {
 		return nil
@@ -179,12 +185,8 @@ func (_c *Client) captureProviderUsageDayBoundary(_ctx context.Context, _balance
 				return
 			}
 			_remaining := _usage.OverallRemainingPercent()
-			var _err error
-			if _isStart {
-				_err = providerusage.DefaultRecorder().RecordDayStart(providerIDForLog(_target), _remaining, _boundaryAt)
-			} else {
-				_err = providerusage.DefaultRecorder().RecordDayEnd(providerIDForLog(_target), _remaining, _boundaryAt)
-			}
+			_err := providerusage.DefaultRecorder().RecordBoundaryObservation(providerIDForLog(_target), _remaining,
+				_boundaryAt, _usage.UpdatedAt, _target.UsageObservationContext(_usage), _isStart)
 			if _err != nil {
 				log.Printf("provider daily usage boundary record failed: provider=%s start=%t error=%v", providerIDForLog(_target), _isStart, _err)
 			}

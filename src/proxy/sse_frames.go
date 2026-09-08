@@ -17,6 +17,15 @@ type SSEDataFrame struct {
 	Data  string
 }
 
+func streamEventHasDoneMarker(event string) bool {
+	for _, frame := range ParseSSEDataFrames(event) {
+		if strings.TrimSpace(frame.Data) == "[DONE]" {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseSSEDataFrames 供已組成完整事件的呼叫端使用；多個 data 欄位依 SSE 規則以換行串接。
 func ParseSSEDataFrames(input string) []SSEDataFrame {
 	input = strings.ReplaceAll(input, "\r\n", "\n")

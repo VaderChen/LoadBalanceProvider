@@ -23,12 +23,13 @@ type codexAccountUsageWindow struct {
 func (c *Client) refreshOpenAICodexOAuthUsage(ctx context.Context, provider *balancer.ProviderRuntime) error {
 	started := time.Now()
 	provider.MarkUsageProbeAttempt(started)
+	identity := ""
 	raw, err := c.requestCodexAccountAPI(ctx, provider.Config, http.MethodGet,
-		codexAccountAPIURL(provider.Config, "usage"), nil, 45*time.Second)
+		codexAccountAPIURL(provider.Config, "usage"), nil, 45*time.Second, &identity)
 	if err == nil {
 		var headers http.Header
 		headers, err = codexAccountUsageHeaders(raw)
-		if err == nil && !provider.RecordCodexAccountUsage(headers, providerUsageStaleThreshold) {
+		if err == nil && !provider.RecordCodexAccountUsage(headers, balancer.AccountUsageFreshness, identity) {
 			err = fmt.Errorf("帳號用量 API 未產生有效觀測")
 		}
 	}

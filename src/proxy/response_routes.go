@@ -70,12 +70,32 @@ func (_c *Client) RecordPromptCacheRoute(_routeID string, _providerID string, _m
 		CreatedAt:  _now,
 	}
 	_c.responseRouteMutationLock.Lock()
+	if value, ok := _c.ResponseRoutes.Load(_routeID); ok {
+		if prior, valid := value.(ResponseRouteTarget); valid && prior.ProviderID == _target.ProviderID && prior.Model == _target.Model && prior.Owner == _target.Owner {
+			_target.Persisted = prior.Persisted
+		}
+	}
 	if _, _loaded := _c.ResponseRoutes.Swap(_routeID, _target); !_loaded {
 		atomic.AddInt64(&_c.responseRouteCount, 1)
 	}
 	_c.responseRouteMutationLock.Unlock()
 	if atomic.LoadInt64(&_c.responseRouteCount) > int64(_c.responseRouteMaxEntriesValue()) {
 		_c.pruneResponseRoutes(_now, true)
+	}
+}
+
+// 只標記剛寫入資料庫的相同配對，保留快照內容與快取計數。
+func (c *Client) MarkResponseRoutePersisted(route string, target ResponseRouteTarget) {
+	if c == nil {
+		return
+	}
+	c.responseRouteMutationLock.Lock()
+	defer c.responseRouteMutationLock.Unlock()
+	value, ok := c.ResponseRoutes.Load(route)
+	prior, valid := value.(ResponseRouteTarget)
+	if ok && valid && prior.ProviderID == target.ProviderID && prior.Model == target.Model && prior.Owner == target.Owner {
+		prior.Persisted = true
+		c.ResponseRoutes.Store(route, prior)
 	}
 }
 

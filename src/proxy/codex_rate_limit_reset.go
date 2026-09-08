@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -215,13 +216,16 @@ func codexResetCreditExpiry(_value *string) (time.Time, bool) {
 	return _expiry, _err == nil
 }
 
-func (_c *Client) requestCodexAccountAPI(_ctx context.Context, _provider *domain.LLMProviderConfig, _method string, _targetURL string, _body []byte, _timeout time.Duration) ([]byte, error) {
+func (_c *Client) requestCodexAccountAPI(_ctx context.Context, _provider *domain.LLMProviderConfig, _method string, _targetURL string, _body []byte, _timeout time.Duration, _identity ...*string) ([]byte, error) {
 	_auth, _err := codexauth.Ensure(_provider.ID)
 	if _err != nil {
 		return nil, fmt.Errorf("openai codex oauth unavailable: %w", _err)
 	}
 	if strings.TrimSpace(_auth.AccessToken) == "" {
 		return nil, fmt.Errorf("openai codex oauth access token is empty")
+	}
+	if len(_identity) > 0 && _identity[0] != nil && _auth.AccountID != "" {
+		*_identity[0] = fmt.Sprintf("%x", sha256.Sum256([]byte(_auth.AccountID)))
 	}
 	if _err := security.ValidateOutboundURL(_targetURL); _err != nil {
 		return nil, _err

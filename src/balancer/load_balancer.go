@@ -27,11 +27,13 @@ const minProviderUsageRemainingPercent = 5.0
 
 // -------------------------------------------------------------------------------------
 type LoadBalancer struct {
-	_lock     sync.RWMutex
-	Config    *domain.ProxyConfig
-	Analyzer  *analyzer.RequestAnalyzer
-	Cache     *classifier.Cache
-	Providers []*ProviderRuntime
+	_lock              sync.RWMutex
+	_admissionLock     sync.Mutex
+	_admissionSequence uint64
+	Config             *domain.ProxyConfig
+	Analyzer           *analyzer.RequestAnalyzer
+	Cache              *classifier.Cache
+	Providers          []*ProviderRuntime
 
 	// 對話綁定數快照。實際資料在 proxy 層（proxy 依賴 balancer，不能反向匯入），
 	// 因此由 API 層在選擇前寫入。
@@ -42,6 +44,9 @@ type LoadBalancer struct {
 
 // -------------------------------------------------------------------------------------
 type ProviderRuntime struct {
+	// 設定不可變；相同來源的快照共用初始 Runtime 的執行狀態。
+	shared                   *ProviderRuntime
+	lastAdmission            uint64
 	modelCooldownLock        sync.Mutex
 	modelCooldowns           map[string]time.Time
 	Config                   *domain.LLMProviderConfig
@@ -75,11 +80,17 @@ type ProviderRuntime struct {
 	accountUsageAt           time.Time
 	accountUsageUntil        time.Time
 	LastUsageProbeAt         int64
+	usageProbeRunning        bool
+	usageProbeSuccess        time.Time
+	usageProbeNext           time.Time
+	usageProbeError          string
 	AuthError                ProviderAuthErrorState
 }
 
 // -------------------------------------------------------------------------------------
 type ProviderUsageSnapshot struct {
+	AccountIdentity             string            `json:"-"`
+	Source                      string            `json:"source,omitempty"`
 	UpdatedAt                   time.Time         `json:"updated_at,omitempty"`
 	LimitRequests               string            `json:"limit_requests,omitempty"`
 	RemainingRequests           string            `json:"remaining_requests,omitempty"`
@@ -234,8 +245,8 @@ func (_b *LoadBalancer) ReloadConfig(_config *domain.ProxyConfig) {
 	_providers := make([]*ProviderRuntime, 0, len(_config.Providers))
 	for _idx := range _config.Providers {
 		_runtime := &ProviderRuntime{Config: &_config.Providers[_idx]}
-		if _old := _oldStats[_runtime.Config.ID]; _old != nil {
-			_runtime.copyRuntimeState(_old)
+		if _old := _oldStats[_runtime.Config.ID]; _old != nil && sameProviderIdentity(_runtime.Config, _old.Config) {
+			_runtime.shared = _old.runtimeState()
 		}
 		_providers = append(_providers, _runtime)
 	}
@@ -279,6 +290,18 @@ func (_b *LoadBalancer) Select(_req *domain.ChatCompletionRequest) (*ProviderRun
 
 // -------------------------------------------------------------------------------------
 func (_b *LoadBalancer) SelectExcluding(_req *domain.ChatCompletionRequest, _excludedProviderIDs []string) (*ProviderRuntime, *domain.LLMModelConfig, domain.RequestProfile, SelectionMeta, error) {
+	return _b.selectExcluding(_req, _excludedProviderIDs, false)
+}
+
+func (_b *LoadBalancer) Acquire(_req *domain.ChatCompletionRequest) (*ProviderRuntime, *domain.LLMModelConfig, domain.RequestProfile, SelectionMeta, error) {
+	return _b.AcquireExcluding(_req, nil)
+}
+
+func (_b *LoadBalancer) AcquireExcluding(_req *domain.ChatCompletionRequest, _excludedProviderIDs []string) (*ProviderRuntime, *domain.LLMModelConfig, domain.RequestProfile, SelectionMeta, error) {
+	return _b.selectExcluding(_req, _excludedProviderIDs, true)
+}
+
+func (_b *LoadBalancer) selectExcluding(_req *domain.ChatCompletionRequest, _excludedProviderIDs []string, reserve bool) (*ProviderRuntime, *domain.LLMModelConfig, domain.RequestProfile, SelectionMeta, error) {
 	_profile := _b.classifyRequest(_req)
 	_excluded := map[string]bool{}
 	for _, _providerID := range _excludedProviderIDs {
@@ -304,7 +327,34 @@ func (_b *LoadBalancer) SelectExcluding(_req *domain.ChatCompletionRequest, _exc
 			RequestProfile: _profile,
 		}, _selectionErr
 	}
-	_selected, _meta := _b.selectWithStrategy(_candidates, _profile, _requestedModel)
+	// 選擇與保留名額在同一短鎖內完成；網路請求不持有此鎖。
+	_b._admissionLock.Lock()
+	defer _b._admissionLock.Unlock()
+	choose := func() (ProviderSelection, SelectionMeta) {
+		selected, meta := _b.selectWithStrategy(_candidates, _profile, _requestedModel)
+		if !requestPinsProvider(_req) {
+			selected, meta = _b.balanceNewTurn(_candidates, selected, meta)
+		}
+		return selected, meta
+	}
+	_selected, _meta := choose()
+	if reserve {
+		for !_selected.Provider.tryStartRequest() {
+			next := _candidates[:0]
+			for _, candidate := range _candidates {
+				if candidate.Provider != _selected.Provider {
+					next = append(next, candidate)
+				}
+			}
+			_candidates = next
+			if len(_candidates) == 0 {
+				return nil, nil, _profile, _meta, _b.noAvailableProviderError(_req, _profile, _requestedModel, _excluded)
+			}
+			_selected, _meta = choose()
+		}
+		_b._admissionSequence++
+		_selected.Provider.runtimeState().lastAdmission = _b._admissionSequence
+	}
 	if _modelFallbackReason != "" {
 		_meta.Reason = _modelFallbackReason + "; " + _meta.Reason
 	}
@@ -351,11 +401,11 @@ func (_b *LoadBalancer) noAvailableProviderError(_req *domain.ChatCompletionRequ
 			}
 			_matchingProviders++
 			_until := _provider.CooldownUntil(_model.Name)
-			if _accountUntil := time.Unix(0, atomic.LoadInt64(&_provider.CapacityUnavailableUntil)); _accountUntil.After(_until) {
+			if _accountUntil := time.Unix(0, atomic.LoadInt64(&_provider.runtimeState().CapacityUnavailableUntil)); _accountUntil.After(_until) {
 				_until = _accountUntil
 			}
 			// 併發滿載短暫等待後重查，仍受請求等待預算限制。
-			if !_until.After(_now) && _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.Active) >= _provider.Config.MaxConcurrent {
+			if !_until.After(_now) && _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.runtimeState().Active) >= _provider.Config.MaxConcurrent {
 				_until = _now.Add(time.Second)
 			}
 			if !_until.After(_now) {
@@ -455,7 +505,7 @@ func (_b *LoadBalancer) collectCandidates(_req *domain.ChatCompletionRequest, _p
 	_exhausted := make([]ProviderSelection, 0)
 	// 明確指定 provider 的請求（對話黏著或金鑰強制路由）不受上限影響，
 	// 否則既有對話會直接失去唯一的候選。
-	_pinned := strings.TrimSpace(_req.ProviderID) != "" || strings.TrimSpace(_req.Provider) != ""
+	_pinned := requestPinsProvider(_req)
 	_now := time.Now()
 	for _, _provider := range _b.Providers {
 		if _provider == nil || _provider.Config == nil {
@@ -486,12 +536,13 @@ func (_b *LoadBalancer) collectCandidates(_req *domain.ChatCompletionRequest, _p
 			continue
 		}
 
-		if _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.Active) >= _provider.Config.MaxConcurrent {
+		if _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.runtimeState().Active) >= _provider.Config.MaxConcurrent {
 			continue
 		}
 
 		// 可用量見底不再直接跳過，改為降級成最後手段。
-		_exhaustedUsage := _provider.UsageSnapshot().ExhaustedForSelection()
+		_usage := _provider.UsageSnapshot()
+		_exhaustedUsage := _provider.UsageFresh(_usage, _now) && _usage.ExhaustedForSelection()
 
 		_models := candidateModels(_provider.Config, _requestedModel)
 		for _modelIdx := range _models {
@@ -785,7 +836,7 @@ func selectionCandidateMeta(_candidates []ProviderSelection) []SelectionCandidat
 			ProviderName:  _candidate.Provider.Config.Name,
 			Model:         _candidate.Model.Name,
 			Score:         _candidate.Score,
-			Active:        atomic.LoadInt64(&_candidate.Provider.Active),
+			Active:        atomic.LoadInt64(&_candidate.Provider.runtimeState().Active),
 			MaxConcurrent: _candidate.Provider.Config.MaxConcurrent,
 			UsagePercent:  _usage.OverallUsagePercent(),
 			RemainPercent: _usage.OverallRemainingPercent(),
@@ -809,7 +860,7 @@ func strategyCandidateMeta(_candidates []ProviderSelection) []strategy.ProviderS
 			ProviderPurpose: _candidate.Provider.Config.Purpose,
 			Model:           _candidate.Model.Name,
 			Score:           _candidate.Score,
-			Active:          atomic.LoadInt64(&_candidate.Provider.Active),
+			Active:          atomic.LoadInt64(&_candidate.Provider.runtimeState().Active),
 			MaxConcurrent:   _candidate.Provider.Config.MaxConcurrent,
 		})
 	}
@@ -818,14 +869,18 @@ func strategyCandidateMeta(_candidates []ProviderSelection) []strategy.ProviderS
 
 // -------------------------------------------------------------------------------------
 func (_b *LoadBalancer) scoreCandidate(_provider *ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _requestedModel string) float64 {
-	_active := float64(atomic.LoadInt64(&_provider.Active))
+	_active := float64(atomic.LoadInt64(&_provider.runtimeState().Active))
 	_capacity := math.Max(float64(_provider.Config.MaxConcurrent), 1)
 	_loadPenalty := (_active / _capacity) * 35
 	_, _latencyP95MS := _provider.LatencySnapshot()
 	_latencyPenalty := math.Min((_latencyP95MS/1000)*6, 30)
-	_failurePenalty := math.Min(float64(atomic.LoadInt64(&_provider.ConsecutiveFailures))*10, 30)
-	_successPenalty := math.Min(math.Sqrt(float64(atomic.LoadInt64(&_provider.Successes)))*1.2, 30)
-	_usageAdjustment := usageScoreAdjustment(_provider.UsageSnapshot())
+	_failurePenalty := math.Min(float64(atomic.LoadInt64(&_provider.runtimeState().ConsecutiveFailures))*10, 30)
+	_successPenalty := math.Min(math.Sqrt(float64(atomic.LoadInt64(&_provider.runtimeState().Successes)))*1.2, 30)
+	_usage := _provider.UsageSnapshot()
+	_usageAdjustment := 0.0
+	if _provider.UsageFresh(_usage, time.Now()) {
+		_usageAdjustment = usageScoreAdjustment(_usage)
+	}
 
 	_score := float64(_provider.Config.Weight*10) +
 		float64(_model.QualityTier*12) -
@@ -941,14 +996,14 @@ func (_b *LoadBalancer) providerStatusLocked() []map[string]interface{} {
 			"name":                              _provider.Config.Name,
 			"role":                              _provider.Config.Role,
 			"enabled":                           _provider.Config.Enabled,
-			"active":                            atomic.LoadInt64(&_provider.Active),
-			"active_requests":                   atomic.LoadInt64(&_provider.Active),
+			"active":                            atomic.LoadInt64(&_provider.runtimeState().Active),
+			"active_requests":                   atomic.LoadInt64(&_provider.runtimeState().Active),
 			"max_concurrent":                    _provider.Config.MaxConcurrent,
-			"successes":                         atomic.LoadInt64(&_provider.Successes),
-			"failures":                          atomic.LoadInt64(&_provider.Failures),
-			"consecutive_failures":              atomic.LoadInt64(&_provider.ConsecutiveFailures),
+			"successes":                         atomic.LoadInt64(&_provider.runtimeState().Successes),
+			"failures":                          atomic.LoadInt64(&_provider.runtimeState().Failures),
+			"consecutive_failures":              atomic.LoadInt64(&_provider.runtimeState().ConsecutiveFailures),
 			"circuit_open":                      _provider.CircuitOpen(time.Now()),
-			"circuit_open_until":                atomic.LoadInt64(&_provider.CircuitOpenUntil),
+			"circuit_open_until":                atomic.LoadInt64(&_provider.runtimeState().CircuitOpenUntil),
 			"latency_p50_ms":                    _latencyP50MS,
 			"latency_p95_ms":                    _latencyP95MS,
 			"reaction_time_ms":                  _reactionMS,
@@ -967,9 +1022,10 @@ func (_b *LoadBalancer) providerStatusLocked() []map[string]interface{} {
 			"provider_reported_generation_tps":  _providerReportedTPS,
 			"last_provider_reported_tps":        _lastProviderReportedTPS,
 			"last_completion_tokens":            _lastCompletionTokens,
-			"total_completion_tokens":           atomic.LoadInt64(&_provider.TotalCompletionTokens),
-			"cumulative_completion_tokens":      atomic.LoadInt64(&_provider.TotalCompletionTokens),
+			"total_completion_tokens":           atomic.LoadInt64(&_provider.runtimeState().TotalCompletionTokens),
+			"cumulative_completion_tokens":      atomic.LoadInt64(&_provider.runtimeState().TotalCompletionTokens),
 			"usage":                             _usage,
+			"usage_probe":                       _provider.UsageProbeStatus(),
 			"auth_error":                        _authError.Active,
 			"auth_error_message":                _authError.Message,
 			"auth_error_at":                     _authError.UpdatedAt,
@@ -1003,9 +1059,9 @@ func (_b *LoadBalancer) StatusText() string {
 		_, _latencyP95MS, _lastDurationMS, _reactionMS, _, _tokenSpeed, _, _ := _provider.MetricsSnapshot()
 		_parts = append(_parts, fmt.Sprintf("%s active=%d success=%d failure=%d reaction=%.0fms last=%.0fms p95=%.0fms tok/s=%.2f circuit=%t",
 			_provider.Config.ID,
-			atomic.LoadInt64(&_provider.Active),
-			atomic.LoadInt64(&_provider.Successes),
-			atomic.LoadInt64(&_provider.Failures),
+			atomic.LoadInt64(&_provider.runtimeState().Active),
+			atomic.LoadInt64(&_provider.runtimeState().Successes),
+			atomic.LoadInt64(&_provider.runtimeState().Failures),
 			_reactionMS,
 			_lastDurationMS,
 			_latencyP95MS,
@@ -1019,27 +1075,27 @@ func (_b *LoadBalancer) StatusText() string {
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) StartRequest() {
-	atomic.AddInt64(&_p.Active, 1)
+	atomic.AddInt64(&_p.runtimeState().Active, 1)
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) ActiveCount() int64 {
-	return atomic.LoadInt64(&_p.Active)
+	return atomic.LoadInt64(&_p.runtimeState().Active)
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) SuccessCount() int64 {
-	return atomic.LoadInt64(&_p.Successes)
+	return atomic.LoadInt64(&_p.runtimeState().Successes)
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) FailureCount() int64 {
-	return atomic.LoadInt64(&_p.Failures)
+	return atomic.LoadInt64(&_p.runtimeState().Failures)
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) FinishRequest() {
-	atomic.AddInt64(&_p.Active, -1)
+	atomic.AddInt64(&_p.runtimeState().Active, -1)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1052,16 +1108,16 @@ func (_p *ProviderRuntime) MarkSuccessWithMetrics(_latency time.Duration, _compl
 	_durationMS := float64(_latency) / float64(time.Millisecond)
 	_tokenSpeed = NormalizeTokenRate(int64(_completionTokens), _durationMS, _tokenSpeed)
 	_clientDeliveryTPS = NormalizeTokenRate(int64(_completionTokens), _durationMS, _clientDeliveryTPS)
-	atomic.AddInt64(&_p.Successes, 1)
-	atomic.StoreInt64(&_p.ConsecutiveFailures, 0)
-	_p.overloadLock.Lock()
+	atomic.AddInt64(&_p.runtimeState().Successes, 1)
+	atomic.StoreInt64(&_p.runtimeState().ConsecutiveFailures, 0)
+	_p.runtimeState().overloadLock.Lock()
 	// 冷卻期間完成的既有請求不代表來源已恢復，不能清除這一波退避。
-	if !time.Now().Before(_p.overloadUntil) {
-		_p.consecutiveOverloads = 0
-		_p.overloadUntil = time.Time{}
+	if !time.Now().Before(_p.runtimeState().overloadUntil) {
+		_p.runtimeState().consecutiveOverloads = 0
+		_p.runtimeState().overloadUntil = time.Time{}
 	}
-	_p.overloadLock.Unlock()
-	atomic.StoreInt64(&_p.CircuitOpenUntil, 0)
+	_p.runtimeState().overloadLock.Unlock()
+	atomic.StoreInt64(&_p.runtimeState().CircuitOpenUntil, 0)
 	_p.ClearAuthError()
 	_p.recordLatency(_latency)
 	_p.recordReaction(_reactionMS)
@@ -1071,33 +1127,33 @@ func (_p *ProviderRuntime) MarkSuccessWithMetrics(_latency time.Duration, _compl
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) MarkFailure(_latency time.Duration) {
-	atomic.AddInt64(&_p.Failures, 1)
-	_failures := atomic.AddInt64(&_p.ConsecutiveFailures, 1)
+	atomic.AddInt64(&_p.runtimeState().Failures, 1)
+	_failures := atomic.AddInt64(&_p.runtimeState().ConsecutiveFailures, 1)
 	_p.recordLatency(_latency)
 	if _failures >= 3 {
-		atomic.StoreInt64(&_p.CircuitOpenUntil, time.Now().Add(30*time.Second).UnixNano())
+		atomic.StoreInt64(&_p.runtimeState().CircuitOpenUntil, time.Now().Add(30*time.Second).UnixNano())
 	}
 }
 
 // -------------------------------------------------------------------------------------
 // NextOverloadBackoff 共用連續過載次數；明確的上游等待時間不受本地上限限制。
 func (_p *ProviderRuntime) NextOverloadBackoff(retryAfter time.Duration) time.Duration {
-	_p.overloadLock.Lock()
-	defer _p.overloadLock.Unlock()
+	_p.runtimeState().overloadLock.Lock()
+	defer _p.runtimeState().overloadLock.Unlock()
 	now := time.Now()
-	if _p.overloadUntil.After(now) {
+	if _p.runtimeState().overloadUntil.After(now) {
 		// 同一窗口不重抽亂數或升級；僅明確的較長 Retry-After 可延長。
-		if retryAfter > 0 && now.Add(retryAfter).After(_p.overloadUntil) {
-			_p.overloadUntil = now.Add(retryAfter)
+		if retryAfter > 0 && now.Add(retryAfter).After(_p.runtimeState().overloadUntil) {
+			_p.runtimeState().overloadUntil = now.Add(retryAfter)
 		}
-		return _p.overloadUntil.Sub(now)
+		return _p.runtimeState().overloadUntil.Sub(now)
 	}
-	_p.consecutiveOverloads = min(_p.consecutiveOverloads+1, 4)
+	_p.runtimeState().consecutiveOverloads = min(_p.runtimeState().consecutiveOverloads+1, 4)
 	delay := retryAfter
 	if delay <= 0 {
-		delay = (2*time.Second)<<uint(_p.consecutiveOverloads-1) + time.Duration(rand.Int64N(int64(time.Second)))
+		delay = (2*time.Second)<<uint(_p.runtimeState().consecutiveOverloads-1) + time.Duration(rand.Int64N(int64(time.Second)))
 	}
-	_p.overloadUntil = now.Add(delay)
+	_p.runtimeState().overloadUntil = now.Add(delay)
 	return delay
 }
 
@@ -1105,12 +1161,12 @@ func (_p *ProviderRuntime) MarkTemporaryUnavailable(_latency time.Duration, _dur
 	if _duration <= 0 {
 		_duration = 30 * time.Second
 	}
-	atomic.AddInt64(&_p.Failures, 1)
+	atomic.AddInt64(&_p.runtimeState().Failures, 1)
 	_p.recordLatency(_latency)
 	_until := time.Now().Add(_duration).UnixNano()
 	for {
-		_previous := atomic.LoadInt64(&_p.CapacityUnavailableUntil)
-		if _previous >= _until || atomic.CompareAndSwapInt64(&_p.CapacityUnavailableUntil, _previous, _until) {
+		_previous := atomic.LoadInt64(&_p.runtimeState().CapacityUnavailableUntil)
+		if _previous >= _until || atomic.CompareAndSwapInt64(&_p.runtimeState().CapacityUnavailableUntil, _previous, _until) {
 			break
 		}
 	}
@@ -1118,35 +1174,35 @@ func (_p *ProviderRuntime) MarkTemporaryUnavailable(_latency time.Duration, _dur
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) CircuitOpen(_now time.Time) bool {
-	_until := atomic.LoadInt64(&_p.CircuitOpenUntil)
+	_until := atomic.LoadInt64(&_p.runtimeState().CircuitOpenUntil)
 	return _until > 0 && _now.UnixNano() < _until
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) CapacityUnavailable(_now time.Time) bool {
-	_until := max(atomic.LoadInt64(&_p.CapacityUnavailableUntil), atomic.LoadInt64(&_p.QuotaUnavailableUntil))
+	_until := max(atomic.LoadInt64(&_p.runtimeState().CapacityUnavailableUntil), atomic.LoadInt64(&_p.runtimeState().QuotaUnavailableUntil))
 	return _until > 0 && _now.UnixNano() < _until
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) LatencySnapshot() (float64, float64) {
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
-	return _p.LatencyEWMA50MS, _p.LatencyEWMA95MS
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
+	return _p.runtimeState().LatencyEWMA50MS, _p.runtimeState().LatencyEWMA95MS
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) MetricsSnapshot() (float64, float64, float64, float64, float64, float64, float64, int64) {
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
-	return _p.LatencyEWMA50MS, _p.LatencyEWMA95MS, _p.LastDurationMS, _p.ReactionEWMA, _p.LastReactionMS, _p.TokenSpeedEWMA, _p.LastTokenSpeed, _p.LastCompletionTokens
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
+	return _p.runtimeState().LatencyEWMA50MS, _p.runtimeState().LatencyEWMA95MS, _p.runtimeState().LastDurationMS, _p.runtimeState().ReactionEWMA, _p.runtimeState().LastReactionMS, _p.runtimeState().TokenSpeedEWMA, _p.runtimeState().LastTokenSpeed, _p.runtimeState().LastCompletionTokens
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) ClientDeliverySnapshot() (float64, float64) {
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
-	return _p.ClientDeliveryEWMA, _p.LastClientDeliveryTPS
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
+	return _p.runtimeState().ClientDeliveryEWMA, _p.runtimeState().LastClientDeliveryTPS
 }
 
 // -------------------------------------------------------------------------------------
@@ -1163,39 +1219,49 @@ func (_p *ProviderRuntime) RecordUsageHeaders(_headers http.Header) {
 }
 
 func (_p *ProviderRuntime) recordUsageSnapshot(_snapshot ProviderUsageSnapshot, _accountMaxAge time.Duration) bool {
+	_snapshot.Source = "headers"
+	if _accountMaxAge > 0 {
+		_snapshot.Source = "account_api"
+	}
 	_remaining, _known := _snapshot.KnownRemainingPercent()
 	if !_known {
 		return false
 	}
-	_p._usageLock.Lock()
+	_p.runtimeState()._usageLock.Lock()
+	if _snapshot.UpdatedAt.Before(_p.runtimeState().Usage.UpdatedAt) {
+		_p.runtimeState()._usageLock.Unlock()
+		return false
+	}
 	if _accountMaxAge > 0 {
-		_p.accountUsageAt = _snapshot.UpdatedAt
-		_p.accountUsageUntil = _snapshot.UpdatedAt.Add(_accountMaxAge)
-		_p.usageHeaderFallback = ProviderUsageSnapshot{}
+		_p.runtimeState().accountUsageAt = _snapshot.UpdatedAt
+		_p.runtimeState().accountUsageUntil = _snapshot.UpdatedAt.Add(_accountMaxAge)
+		_p.runtimeState().usageHeaderFallback = ProviderUsageSnapshot{}
 	} else {
-		if !_snapshot.UpdatedAt.Before(_p.usageHeaderFallback.UpdatedAt) && _snapshot.coversUsage(_p.usageHeaderFallback) {
-			_p.usageHeaderFallback = _snapshot
+		_snapshot.AccountIdentity = _p.runtimeState().Usage.AccountIdentity
+		if !_snapshot.UpdatedAt.Before(_p.runtimeState().usageHeaderFallback.UpdatedAt) && _snapshot.coversUsage(_p.runtimeState().usageHeaderFallback) {
+			_p.runtimeState().usageHeaderFallback = _snapshot
 		}
-		if time.Now().Before(_p.accountUsageUntil) || _snapshot.UpdatedAt.Before(_p.Usage.UpdatedAt) {
-			_p._usageLock.Unlock()
+		if time.Now().Before(_p.runtimeState().accountUsageUntil) || _snapshot.UpdatedAt.Before(_p.runtimeState().Usage.UpdatedAt) {
+			_p.runtimeState()._usageLock.Unlock()
 			return false
 		}
 	}
 	// 不用不完整的新快照取代完整的舊快照，避免統計在不同額度窗口間跳動。
-	if _accountMaxAge <= 0 && !_snapshot.coversUsage(_p.Usage) {
-		_p._usageLock.Unlock()
+	if _accountMaxAge <= 0 && !_snapshot.coversUsage(_p.runtimeState().Usage) {
+		_p.runtimeState()._usageLock.Unlock()
 		return false
 	}
-	_p.Usage = _snapshot
-	_p._usageLock.Unlock()
+	_p.runtimeState().Usage = _snapshot
+	_p.runtimeState()._usageLock.Unlock()
 	if _p.Config == nil || !_snapshot.HasUsageInfo() {
 		return true
 	}
-	if _err := providerusage.DefaultRecorder().Record(
+	if _err := providerusage.DefaultRecorder().RecordObservation(
 		_p.Config.ID,
 		100-_remaining,
 		_remaining,
 		_snapshot.UpdatedAt,
+		_p.UsageObservationContext(_snapshot),
 	); _err != nil {
 		log.Printf("provider usage history record failed: provider=%s error=%v", _p.Config.ID, _err)
 	}
@@ -1241,7 +1307,7 @@ func (_b *LoadBalancer) ProviderAvailableForSelection(_providerID string) bool {
 			!_provider.CircuitOpen(_now) &&
 			!_provider.CapacityUnavailable(_now) &&
 			!_provider.HasAuthError() &&
-			(_provider.Config.MaxConcurrent <= 0 || atomic.LoadInt64(&_provider.Active) < _provider.Config.MaxConcurrent)
+			(_provider.Config.MaxConcurrent <= 0 || atomic.LoadInt64(&_provider.runtimeState().Active) < _provider.Config.MaxConcurrent)
 	}
 	return false
 }
@@ -1287,7 +1353,7 @@ func (_b *LoadBalancer) QuotaBelowPeerAverage(_providerID string, _tolerancePoin
 		if _provider.CircuitOpen(_now) || _provider.CapacityUnavailable(_now) || _provider.HasAuthError() {
 			continue
 		}
-		if _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.Active) >= _provider.Config.MaxConcurrent {
+		if _provider.Config.MaxConcurrent > 0 && atomic.LoadInt64(&_provider.runtimeState().Active) >= _provider.Config.MaxConcurrent {
 			continue
 		}
 		_usage := _provider.UsageSnapshot()
@@ -1327,9 +1393,9 @@ func (_p *ProviderRuntime) UsageSnapshot() ProviderUsageSnapshot {
 	if _p == nil {
 		return ProviderUsageSnapshot{}
 	}
-	_p._usageLock.Lock()
-	defer _p._usageLock.Unlock()
-	return cloneProviderUsageSnapshot(_p.Usage)
+	_p.runtimeState()._usageLock.Lock()
+	defer _p.runtimeState()._usageLock.Unlock()
+	return cloneProviderUsageSnapshot(_p.runtimeState().Usage)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1353,7 +1419,7 @@ func (_p *ProviderRuntime) ShouldProbeAccountUsage(_now time.Time, _maxAge time.
 	if _p == nil || _p.HasAuthError() {
 		return false
 	}
-	_lastProbe := atomic.LoadInt64(&_p.LastUsageProbeAt)
+	_lastProbe := atomic.LoadInt64(&_p.runtimeState().LastUsageProbeAt)
 	if _lastProbe <= 0 {
 		return true
 	}
@@ -1368,7 +1434,7 @@ func (_p *ProviderRuntime) MarkUsageProbeAttempt(_now time.Time) {
 	if _now.IsZero() {
 		_now = time.Now()
 	}
-	atomic.StoreInt64(&_p.LastUsageProbeAt, _now.UnixNano())
+	atomic.StoreInt64(&_p.runtimeState().LastUsageProbeAt, _now.UnixNano())
 }
 
 // -------------------------------------------------------------------------------------
@@ -1380,13 +1446,13 @@ func (_p *ProviderRuntime) MarkAuthError(_message string) {
 	if _message == "" {
 		_message = "provider authentication token is invalid"
 	}
-	_p._usageLock.Lock()
-	_p.AuthError = ProviderAuthErrorState{
+	_p.runtimeState()._usageLock.Lock()
+	_p.runtimeState().AuthError = ProviderAuthErrorState{
 		Active:    true,
 		Message:   _message,
 		UpdatedAt: time.Now(),
 	}
-	_p._usageLock.Unlock()
+	_p.runtimeState()._usageLock.Unlock()
 }
 
 // -------------------------------------------------------------------------------------
@@ -1394,9 +1460,9 @@ func (_p *ProviderRuntime) ClearAuthError() {
 	if _p == nil {
 		return
 	}
-	_p._usageLock.Lock()
-	_p.AuthError = ProviderAuthErrorState{}
-	_p._usageLock.Unlock()
+	_p.runtimeState()._usageLock.Lock()
+	_p.runtimeState().AuthError = ProviderAuthErrorState{}
+	_p.runtimeState()._usageLock.Unlock()
 }
 
 // -------------------------------------------------------------------------------------
@@ -1404,9 +1470,9 @@ func (_p *ProviderRuntime) HasAuthError() bool {
 	if _p == nil {
 		return false
 	}
-	_p._usageLock.Lock()
-	defer _p._usageLock.Unlock()
-	return _p.AuthError.Active
+	_p.runtimeState()._usageLock.Lock()
+	defer _p.runtimeState()._usageLock.Unlock()
+	return _p.runtimeState().AuthError.Active
 }
 
 // -------------------------------------------------------------------------------------
@@ -1414,9 +1480,9 @@ func (_p *ProviderRuntime) AuthErrorSnapshot() ProviderAuthErrorState {
 	if _p == nil {
 		return ProviderAuthErrorState{}
 	}
-	_p._usageLock.Lock()
-	defer _p._usageLock.Unlock()
-	return _p.AuthError
+	_p.runtimeState()._usageLock.Lock()
+	defer _p.runtimeState()._usageLock.Unlock()
+	return _p.runtimeState().AuthError
 }
 
 // -------------------------------------------------------------------------------------
@@ -1625,21 +1691,21 @@ func (_p *ProviderRuntime) recordLatency(_latency time.Duration) {
 	}
 
 	_sampleMS := float64(_latency.Milliseconds())
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
-	_p.LastDurationMS = _sampleMS
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
+	_p.runtimeState().LastDurationMS = _sampleMS
 
-	if _p.LatencyEWMA50MS <= 0 {
-		_p.LatencyEWMA50MS = _sampleMS
-		_p.LatencyEWMA95MS = _sampleMS
+	if _p.runtimeState().LatencyEWMA50MS <= 0 {
+		_p.runtimeState().LatencyEWMA50MS = _sampleMS
+		_p.runtimeState().LatencyEWMA95MS = _sampleMS
 		return
 	}
 
-	_p.LatencyEWMA50MS = ewma(_p.LatencyEWMA50MS, _sampleMS, 0.25)
-	if _sampleMS > _p.LatencyEWMA95MS {
-		_p.LatencyEWMA95MS = ewma(_p.LatencyEWMA95MS, _sampleMS, 0.35)
+	_p.runtimeState().LatencyEWMA50MS = ewma(_p.runtimeState().LatencyEWMA50MS, _sampleMS, 0.25)
+	if _sampleMS > _p.runtimeState().LatencyEWMA95MS {
+		_p.runtimeState().LatencyEWMA95MS = ewma(_p.runtimeState().LatencyEWMA95MS, _sampleMS, 0.35)
 	} else {
-		_p.LatencyEWMA95MS = ewma(_p.LatencyEWMA95MS, _sampleMS, 0.05)
+		_p.runtimeState().LatencyEWMA95MS = ewma(_p.runtimeState().LatencyEWMA95MS, _sampleMS, 0.05)
 	}
 }
 
@@ -1649,20 +1715,20 @@ func (_p *ProviderRuntime) recordTokenMetrics(_completionTokens int, _tokenSpeed
 		return
 	}
 
-	atomic.AddInt64(&_p.TotalCompletionTokens, int64(_completionTokens))
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
+	atomic.AddInt64(&_p.runtimeState().TotalCompletionTokens, int64(_completionTokens))
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
 
-	_p.LastCompletionTokens = int64(_completionTokens)
+	_p.runtimeState().LastCompletionTokens = int64(_completionTokens)
 	if _tokenSpeed <= 0 {
 		return
 	}
-	_p.LastTokenSpeed = _tokenSpeed
-	if _p.TokenSpeedEWMA <= 0 {
-		_p.TokenSpeedEWMA = _tokenSpeed
+	_p.runtimeState().LastTokenSpeed = _tokenSpeed
+	if _p.runtimeState().TokenSpeedEWMA <= 0 {
+		_p.runtimeState().TokenSpeedEWMA = _tokenSpeed
 		return
 	}
-	_p.TokenSpeedEWMA = ewma(_p.TokenSpeedEWMA, _tokenSpeed, tokenRateEWMAAlpha)
+	_p.runtimeState().TokenSpeedEWMA = ewma(_p.runtimeState().TokenSpeedEWMA, _tokenSpeed, tokenRateEWMAAlpha)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1670,15 +1736,15 @@ func (_p *ProviderRuntime) recordClientDeliveryTPS(_clientDeliveryTPS float64) {
 	if _clientDeliveryTPS <= 0 {
 		return
 	}
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
 
-	_p.LastClientDeliveryTPS = _clientDeliveryTPS
-	if _p.ClientDeliveryEWMA <= 0 {
-		_p.ClientDeliveryEWMA = _clientDeliveryTPS
+	_p.runtimeState().LastClientDeliveryTPS = _clientDeliveryTPS
+	if _p.runtimeState().ClientDeliveryEWMA <= 0 {
+		_p.runtimeState().ClientDeliveryEWMA = _clientDeliveryTPS
 		return
 	}
-	_p.ClientDeliveryEWMA = ewma(_p.ClientDeliveryEWMA, _clientDeliveryTPS, tokenRateEWMAAlpha)
+	_p.runtimeState().ClientDeliveryEWMA = ewma(_p.runtimeState().ClientDeliveryEWMA, _clientDeliveryTPS, tokenRateEWMAAlpha)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1688,86 +1754,43 @@ func (_p *ProviderRuntime) RecordProviderReportedTPS(_tps float64) {
 	if _tps <= 0 {
 		return
 	}
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
 
-	_p.LastProviderReportedTPS = _tps
-	if _p.ProviderReportedTPSEWMA <= 0 {
-		_p.ProviderReportedTPSEWMA = _tps
+	_p.runtimeState().LastProviderReportedTPS = _tps
+	if _p.runtimeState().ProviderReportedTPSEWMA <= 0 {
+		_p.runtimeState().ProviderReportedTPSEWMA = _tps
 		return
 	}
-	_p.ProviderReportedTPSEWMA = ewma(_p.ProviderReportedTPSEWMA, _tps, tokenRateEWMAAlpha)
+	_p.runtimeState().ProviderReportedTPSEWMA = ewma(_p.runtimeState().ProviderReportedTPSEWMA, _tps, tokenRateEWMAAlpha)
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) ProviderReportedTPSSnapshot() (float64, float64) {
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
-	return _p.ProviderReportedTPSEWMA, _p.LastProviderReportedTPS
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
+	return _p.runtimeState().ProviderReportedTPSEWMA, _p.runtimeState().LastProviderReportedTPS
 }
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) recordReaction(_reactionMS float64) {
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
+	_p.runtimeState()._latencyLock.Lock()
+	defer _p.runtimeState()._latencyLock.Unlock()
 
 	if _reactionMS <= 0 {
-		_p.LastReactionMS = 0
+		_p.runtimeState().LastReactionMS = 0
 		return
 	}
 
-	_p.LastReactionMS = _reactionMS
-	if _p.ReactionEWMA <= 0 {
-		_p.ReactionEWMA = _reactionMS
+	_p.runtimeState().LastReactionMS = _reactionMS
+	if _p.runtimeState().ReactionEWMA <= 0 {
+		_p.runtimeState().ReactionEWMA = _reactionMS
 		return
 	}
-	_p.ReactionEWMA = ewma(_p.ReactionEWMA, _reactionMS, 0.25)
+	_p.runtimeState().ReactionEWMA = ewma(_p.runtimeState().ReactionEWMA, _reactionMS, 0.25)
 }
 
 // -------------------------------------------------------------------------------------
-func (_p *ProviderRuntime) copyRuntimeState(_old *ProviderRuntime) {
-	// 設定重載保留相同來源的冷卻，不讓儲存介面設定繞過退避。
-	if _p.Config.BaseURL == _old.Config.BaseURL && _p.Config.APIKey == _old.Config.APIKey && _p.Config.APIKeyEnv == _old.Config.APIKeyEnv && _p.Config.Kind == _old.Config.Kind {
-		_p.CapacityUnavailableUntil = atomic.LoadInt64(&_old.CapacityUnavailableUntil)
-		_p.QuotaUnavailableUntil = atomic.LoadInt64(&_old.QuotaUnavailableUntil)
-		_old.modelCooldownLock.Lock()
-		_p.modelCooldowns = make(map[string]time.Time, len(_old.modelCooldowns))
-		for k, v := range _old.modelCooldowns {
-			_p.modelCooldowns[k] = v
-		}
-		_old.modelCooldownLock.Unlock()
-		_old.overloadLock.Lock()
-		_p.consecutiveOverloads, _p.overloadUntil = _old.consecutiveOverloads, _old.overloadUntil
-		_old.overloadLock.Unlock()
-	}
-	_p.Successes = atomic.LoadInt64(&_old.Successes)
-	_p.Failures = atomic.LoadInt64(&_old.Failures)
-	_p.ConsecutiveFailures = atomic.LoadInt64(&_old.ConsecutiveFailures)
-	_p.CircuitOpenUntil = atomic.LoadInt64(&_old.CircuitOpenUntil)
-
-	_p50, _p95, _lastDurationMS, _reactionMS, _lastReactionMS, _tokenSpeed, _lastTokenSpeed, _lastCompletionTokens := _old.MetricsSnapshot()
-	_p._latencyLock.Lock()
-	defer _p._latencyLock.Unlock()
-	_p.LatencyEWMA50MS = _p50
-	_p.LatencyEWMA95MS = _p95
-	_p.LastDurationMS = _lastDurationMS
-	_p.ReactionEWMA = _reactionMS
-	_p.LastReactionMS = _lastReactionMS
-	_p.TokenSpeedEWMA = _tokenSpeed
-	_p.LastTokenSpeed = _lastTokenSpeed
-	_p.LastCompletionTokens = _lastCompletionTokens
-	_p.ClientDeliveryEWMA, _p.LastClientDeliveryTPS = _old.ClientDeliverySnapshot()
-	_p.ProviderReportedTPSEWMA, _p.LastProviderReportedTPS = _old.ProviderReportedTPSSnapshot()
-	_old._usageLock.Lock()
-	_p.Usage = cloneProviderUsageSnapshot(_old.Usage)
-	_p.usageHeaderFallback = cloneProviderUsageSnapshot(_old.usageHeaderFallback)
-	_p.accountUsageAt, _p.accountUsageUntil = _old.accountUsageAt, _old.accountUsageUntil
-	_old._usageLock.Unlock()
-	_p.AuthError = _old.AuthErrorSnapshot()
-	atomic.StoreInt64(&_p.LastUsageProbeAt, atomic.LoadInt64(&_old.LastUsageProbeAt))
-	atomic.StoreInt64(&_p.TotalCompletionTokens, atomic.LoadInt64(&_old.TotalCompletionTokens))
-}
-
 // -------------------------------------------------------------------------------------
 func ewma(_current float64, _sample float64, _alpha float64) float64 {
 	return (_alpha * _sample) + ((1 - _alpha) * _current)

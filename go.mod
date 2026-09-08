@@ -4,6 +4,7 @@ go 1.25.6
 
 require (
 	github.com/shirou/gopsutil/v3 v3.24.5
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/image v0.45.0
 )
 

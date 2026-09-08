@@ -3060,7 +3060,8 @@
         }
         if (cached) {
           enabledRemainingValues.push(cached.value);
-          if (value === null || Date.now() - cached.capturedAt > 120000) staleQuotaCount++;
+          const freshnessMS = Number(item?.usage_probe?.freshness_seconds || 360) * 1000;
+          if (value === null || Date.now() - cached.capturedAt > freshnessMS) staleQuotaCount++;
         }
       }
       const totalRemaining = enabledRemainingValues.length
@@ -3377,6 +3378,13 @@
     function buildRemainingUsageRows(rows, item, usage) {
       const headers = usage.headers && typeof usage.headers === "object" ? usage.headers : {};
       const hasUsage = providerHasUsageInfo(item, usage);
+      const probe = item.usage_probe || {};
+      if (usage.source) rows.push({ label: "資料來源", value: usage.source === "account_api" ? "帳號 API" : "回應標頭（備援）" });
+      if (probe.running) rows.push({ label: "查詢狀態", value: "查詢中" });
+      else if (probe.error) rows.push({ label: "查詢狀態", value: probe.error });
+      for (const [key, label] of [["last_attempt", "上次查詢"], ["last_success", "查詢成功"], ["next_due", "下次查詢"]]) {
+        if (Date.parse(probe[key]) > 0) rows.push({ label, value: formatUsageTime(probe[key]) });
+      }
       if (item.auth_error) {
         rows.push({ label: "狀態", value: "登入 TOKEN 已失效" });
         if (item.auth_error_message) {
@@ -4775,7 +4783,7 @@
           els.providerUsageStatsMessage.textContent = observedDays > 0
 	            ? `${month} 已記錄 ${observedDays} 天額度資料；當日數值會隨最新用量動態更新，23:59 後完成結算。`
             : `${month} 尚無 Provider 額度紀錄。`;
-          if (unverifiedDays > 0) els.providerUsageStatsMessage.textContent += ` ${unverifiedDays} 天包含舊版未經完整性驗證的資料，僅供參考，未自動更改歷史用量。`;
+          if (unverifiedDays > 0) els.providerUsageStatsMessage.textContent += ` ${unverifiedDays} 天缺少完整基準、含來源切換或舊版資料，用量僅供參考，未回填缺漏或重算舊紀錄。`;
         }
       } catch (err) {
         await renderProviderUsageChart({ month, days: [], provider_count: 0, observed_days: 0 });
