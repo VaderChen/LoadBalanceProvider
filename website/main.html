@@ -3424,6 +3424,13 @@
       const usage = item.usage && typeof item.usage === "object" ? item.usage : {};
       const rows = [];
       buildRemainingUsageRows(rows, item, usage);
+      const downtime = provider?.downtime;
+      rows.push({
+        label: "停機時段",
+        value: downtime?.enabled && downtime.start && downtime.end
+          ? `每日 ${downtime.start}–${downtime.start > downtime.end ? "次日 " : ""}${downtime.end}（台北時間）`
+          : "未啟用"
+      });
       const body = rows.length
         ? rows.map(row => `
             <div class="usage-tooltip-row">

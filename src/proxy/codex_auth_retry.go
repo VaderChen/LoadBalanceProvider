@@ -15,7 +15,10 @@ func doCodexHTTPRequest(client *http.Client, req *http.Request, provider *balanc
 }
 
 func doCodexHTTPRequestWithRefresh(client *http.Client, req *http.Request, provider *balancer.ProviderRuntime, apiKey bool, refresh func(context.Context, string, string) (codexauth.Auth, error)) (*http.Response, error) {
-	resp, err := doProviderHTTPRequest(client, req, providerStreamIdleTimeout(provider))
+	if err := provider.Config.CheckScheduledDowntime(); err != nil {
+		return nil, err
+	}
+	resp, err := doProviderHTTPRequest(client, req, providerStreamIdleTimeout(provider), provider.Config)
 	if err != nil || resp.StatusCode != http.StatusUnauthorized || apiKey || req.GetBody == nil {
 		return resp, err
 	}
@@ -35,5 +38,9 @@ func doCodexHTTPRequestWithRefresh(client *http.Client, req *http.Request, provi
 	} else {
 		retry.Header.Del("chatgpt-account-id")
 	}
-	return doProviderHTTPRequest(client, retry, providerStreamIdleTimeout(provider))
+	if err := provider.Config.CheckScheduledDowntime(); err != nil {
+		retry.Body.Close()
+		return nil, err
+	}
+	return doProviderHTTPRequest(client, retry, providerStreamIdleTimeout(provider), provider.Config)
 }

@@ -20,6 +20,9 @@ func sameProviderIdentity(a, b *domain.LLMProviderConfig) bool {
 }
 
 func (p *ProviderRuntime) tryStartRequest() bool {
+	if !p.Config.AvailableNow() {
+		return false
+	}
 	s := p.runtimeState()
 	for {
 		active := atomic.LoadInt64(&s.Active)

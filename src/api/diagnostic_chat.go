@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -27,9 +28,18 @@ func (h *HTTPAPI) handleDiagnosticChat(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	if provider.InScheduledDowntime(time.Now()) {
+		cancel()
+		h.writeJSON(w, http.StatusServiceUnavailable, domain.ErrorResponse("provider_scheduled_downtime", "來源目前為排程停機時段（Asia/Taipei）"))
+		return
+	}
 	defer cancel()
 	resp, err := h.Client.OpenDiagnosticChat(ctx, provider, chat)
 	if err != nil {
+		if errors.Is(err, domain.ErrProviderScheduledDowntime) {
+			h.writeJSON(w, http.StatusServiceUnavailable, domain.ErrorResponse("provider_scheduled_downtime", err.Error()))
+			return
+		}
 		// 連線錯誤可能含 URL 或認證細節，不冒充上游回覆，也不傳出敏感資料。
 		h.writeJSON(w, http.StatusBadGateway, domain.ErrorResponse("diagnostic_transport_error", "代理未取得上游 HTTP 回應：認證、連線或逾時錯誤"))
 		return

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"LoadBalanceProvider/src/domain"
+	"LoadBalanceProvider/src/providerdispatch"
 	"LoadBalanceProvider/src/security"
 )
 
@@ -83,7 +84,10 @@ func (_l *LLM) Classify(_ctx context.Context, _req *domain.ChatCompletionRequest
 		_client = &http.Client{Timeout: 20 * time.Second}
 	}
 
-	_resp, _err := security.GuardedHTTPClient(_client).Do(_httpReq)
+	if err := _l.Provider.CheckScheduledDowntime(); err != nil {
+		return _fallback, false, err
+	}
+	_resp, _err := providerdispatch.Do(_client, _httpReq, &_l.Provider)
 	if _err != nil {
 		return _fallback, false, _err
 	}

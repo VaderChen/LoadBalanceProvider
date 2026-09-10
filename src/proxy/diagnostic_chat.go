@@ -15,6 +15,9 @@ import (
 
 // OpenDiagnosticChat 僅做必要的請求格式與認證轉換，保留上游原始回應，不做重試。
 func (c *Client) OpenDiagnosticChat(ctx context.Context, provider domain.LLMProviderConfig, chat domain.ChatCompletionRequest) (*http.Response, error) {
+	if err := provider.CheckScheduledDowntime(); err != nil {
+		return nil, err
+	}
 	token := strings.TrimSpace(provider.APIKey)
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv(provider.APIKeyEnv))
@@ -69,5 +72,8 @@ func (c *Client) OpenDiagnosticChat(ctx context.Context, provider domain.LLMProv
 		client = *c.HTTPClient
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return security.GuardedHTTPClient(&client).Do(req)
+	if err := provider.CheckScheduledDowntime(); err != nil {
+		return nil, err
+	}
+	return dispatchProviderHTTP(&client, req, &provider)
 }

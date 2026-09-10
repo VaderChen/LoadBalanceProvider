@@ -30,11 +30,12 @@ type dashboardSnapshotCache struct {
 }
 
 type dashboardProvider struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`
-	Model   string `json:"model"`
-	Enabled bool   `json:"enabled"`
+	ID       string                   `json:"id"`
+	Name     string                   `json:"name"`
+	Kind     string                   `json:"kind"`
+	Model    string                   `json:"model"`
+	Enabled  bool                     `json:"enabled"`
+	Downtime *domain.ProviderDowntime `json:"downtime,omitempty"`
 }
 
 func (_h *HTTPAPI) handleDashboardSnapshot(_w http.ResponseWriter) {
@@ -64,6 +65,7 @@ func (_h *HTTPAPI) handleDashboardSnapshot(_w http.ResponseWriter) {
 		_providers = append(_providers, dashboardProvider{
 			ID: _provider.ID, Name: _provider.Name, Kind: inferProviderKind(_provider),
 			Model: _model, Enabled: _provider.Enabled,
+			Downtime: _provider.Downtime,
 		})
 	}
 	_h.applyProviderConversationBindings(_status)

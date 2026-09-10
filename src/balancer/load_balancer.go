@@ -384,7 +384,7 @@ func (_b *LoadBalancer) noAvailableProviderError(_req *domain.ChatCompletionRequ
 			continue
 		}
 		if _excludedProviderIDs[strings.ToLower(strings.TrimSpace(_provider.Config.ID))] ||
-			!_provider.Config.Enabled ||
+			!_provider.Config.AvailableNow() ||
 			!providerMatchesRequest(_provider.Config, _req) ||
 			strings.EqualFold(_provider.Config.Role, "classifier") ||
 			strings.TrimSpace(_provider.Config.BaseURL) == "" ||
@@ -474,7 +474,7 @@ func (_b *LoadBalancer) classifierProviderConfig() (domain.LLMProviderConfig, bo
 	defer _b._lock.RUnlock()
 
 	for _, _provider := range _b.Providers {
-		if _provider == nil || _provider.Config == nil || !_provider.Config.Enabled {
+		if _provider == nil || _provider.Config == nil || !_provider.Config.AvailableNow() {
 			continue
 		}
 		if strings.EqualFold(_provider.Config.Role, "classifier") {
@@ -514,7 +514,7 @@ func (_b *LoadBalancer) collectCandidates(_req *domain.ChatCompletionRequest, _p
 		if _excludedProviderIDs[strings.ToLower(strings.TrimSpace(_provider.Config.ID))] {
 			continue
 		}
-		if !_provider.Config.Enabled {
+		if !_provider.Config.AvailableNow() {
 			continue
 		}
 		if !providerMatchesRequest(_provider.Config, _req) {
@@ -969,7 +969,8 @@ func (_b *LoadBalancer) DashboardSnapshot() ([]domain.LLMProviderConfig, []map[s
 		_config := domain.LLMProviderConfig{
 			ID: _source.ID, Name: _source.Name, Kind: _source.Kind,
 			Enabled: _source.Enabled, Priority: _source.Priority,
-			BaseURL: _source.BaseURL, ChatCompletionsPath: _source.ChatCompletionsPath,
+			Downtime: _source.Downtime,
+			BaseURL:  _source.BaseURL, ChatCompletionsPath: _source.ChatCompletionsPath,
 		}
 		if len(_source.Models) > 0 {
 			_config.Models = []domain.LLMModelConfig{{Name: _source.Models[0].Name}}
@@ -996,6 +997,7 @@ func (_b *LoadBalancer) providerStatusLocked() []map[string]interface{} {
 			"name":                              _provider.Config.Name,
 			"role":                              _provider.Config.Role,
 			"enabled":                           _provider.Config.Enabled,
+			"scheduled_downtime":                _provider.Config.InScheduledDowntime(time.Now()),
 			"active":                            atomic.LoadInt64(&_provider.runtimeState().Active),
 			"active_requests":                   atomic.LoadInt64(&_provider.runtimeState().Active),
 			"max_concurrent":                    _provider.Config.MaxConcurrent,
@@ -1148,10 +1150,10 @@ func (_p *ProviderRuntime) NextOverloadBackoff(retryAfter time.Duration) time.Du
 		}
 		return _p.runtimeState().overloadUntil.Sub(now)
 	}
-	_p.runtimeState().consecutiveOverloads = min(_p.runtimeState().consecutiveOverloads+1, 4)
+	_p.runtimeState().consecutiveOverloads = min(_p.runtimeState().consecutiveOverloads+1, 3)
 	delay := retryAfter
 	if delay <= 0 {
-		delay = (2*time.Second)<<uint(_p.runtimeState().consecutiveOverloads-1) + time.Duration(rand.Int64N(int64(time.Second)))
+		delay = 30*time.Second*time.Duration(_p.runtimeState().consecutiveOverloads) + time.Duration(rand.Int64N(int64(time.Second)))
 	}
 	_p.runtimeState().overloadUntil = now.Add(delay)
 	return delay
@@ -1301,7 +1303,7 @@ func (_b *LoadBalancer) ProviderAvailableForSelection(_providerID string) bool {
 		if !strings.EqualFold(strings.TrimSpace(_provider.Config.ID), _providerID) {
 			continue
 		}
-		return _provider.Config.Enabled &&
+		return _provider.Config.AvailableNow() &&
 			!strings.EqualFold(_provider.Config.Role, "classifier") &&
 			strings.TrimSpace(_provider.Config.BaseURL) != "" &&
 			!_provider.CircuitOpen(_now) &&
@@ -1329,7 +1331,7 @@ func (_b *LoadBalancer) QuotaBelowPeerAverage(_providerID string, _tolerancePoin
 			break
 		}
 	}
-	if _targetProvider == nil || !_targetProvider.Config.Enabled {
+	if _targetProvider == nil || !_targetProvider.Config.AvailableNow() {
 		return false
 	}
 	_targetUsage := _targetProvider.UsageSnapshot()
@@ -1341,7 +1343,7 @@ func (_b *LoadBalancer) QuotaBelowPeerAverage(_providerID string, _tolerancePoin
 	_peerCount := 0
 	_now := time.Now()
 	for _, _provider := range _b.Providers {
-		if _provider == nil || _provider.Config == nil || _provider == _targetProvider || !_provider.Config.Enabled {
+		if _provider == nil || _provider.Config == nil || _provider == _targetProvider || !_provider.Config.AvailableNow() {
 			continue
 		}
 		if strings.EqualFold(_provider.Config.Role, "classifier") {

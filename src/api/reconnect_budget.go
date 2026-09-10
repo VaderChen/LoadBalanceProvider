@@ -19,10 +19,10 @@ const reconnectEntryLimit = 10000
 
 type reconnectIdentityKey struct{}
 
-// 完整 JSON 正規化保留數值精度；無對話識別的獨立請求不依內容猜測重送。
+// 完整 JSON 正規化保留數值精度；僅合併相同已驗證擁有者的相同請求。
 func withReconnectIdentity(r *http.Request, body []byte) *http.Request {
 	owner := proxy.ResponseRouteOwner(r)
-	if owner == "" || owner == "anonymous" || responseTurnRoute(body, r) == "" {
+	if owner == "" || owner == "anonymous" {
 		return r
 	}
 	var payload interface{}
@@ -35,9 +35,13 @@ func withReconnectIdentity(r *http.Request, body []byte) *http.Request {
 	if err != nil {
 		return r
 	}
-	identity, _ := json.Marshal([]string{owner, r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("X-Proxy-Turn-ID"), string(canonical)})
+	identity, _ := json.Marshal([]string{owner, r.Method, r.URL.Path, r.URL.Query().Encode(), r.Header.Get("X-Proxy-Turn-ID"), r.Header.Get("Idempotency-Key"), string(canonical)})
 	key := fmt.Sprintf("%x", sha256.Sum256(identity))
-	ctx := context.WithValue(r.Context(), turnRecoveryKey{}, responseTurnRoute(body, r))
+	turn := responseTurnRoute(body, r)
+	if turn == "" {
+		turn = "reconnect:" + key
+	}
+	ctx := context.WithValue(r.Context(), turnRecoveryKey{}, turn)
 	return r.WithContext(context.WithValue(ctx, reconnectIdentityKey{}, key))
 }
 
@@ -48,22 +52,24 @@ type reconnectBudgetStore struct {
 
 // 由 active 租約獨占讀寫；查詢既有 active 項目時不讀取租約內欄位。
 type reconnectBudget struct {
-	active          bool
-	expires         time.Time
-	retryAt         time.Time
-	waitRetryAt     time.Time
-	attempts        int
-	limit           int
-	waited          time.Duration
-	admissionWaited time.Duration
-	provider, model string
-	rebindFrom      string
-	usedProviders   []string
-	delivered       bool
-	probeAttempts   int
-	probeWindowAt   time.Time
-	round           int
-	recoveryUsed    bool
+	active           bool
+	expires          time.Time
+	retryAt          time.Time
+	waitRetryAt      time.Time
+	attempts         int
+	limit            int
+	waited           time.Duration
+	admissionWaited  time.Duration
+	provider, model  string
+	rebindFrom       string
+	usedProviders    []string
+	delivered        bool
+	probeAttempts    int
+	probeWindowAt    time.Time
+	round            int
+	recoveryUsed     bool
+	nextDispatchAt   time.Time
+	ordinaryFailures int
 }
 
 type reconnectRejection struct {

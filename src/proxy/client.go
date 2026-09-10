@@ -468,7 +468,10 @@ func (_c *Client) sendProviderRequest(_ctx context.Context, _srcReq *http.Reques
 		_targetReq.Header.Set("Authorization", "Bearer "+_apiKey)
 	}
 
-	return doProviderHTTPRequest(_c.HTTPClient, _targetReq, providerStreamIdleTimeout(_provider))
+	if err := _provider.Config.CheckScheduledDowntime(); err != nil {
+		return nil, err
+	}
+	return doProviderHTTPRequest(_c.HTTPClient, _targetReq, providerStreamIdleTimeout(_provider), _provider.Config)
 }
 
 // -------------------------------------------------------------------------------------
@@ -511,7 +514,10 @@ func (_c *Client) sendRawProviderRouteRequest(_ctx context.Context, _srcReq *htt
 	if _client == nil {
 		_client = &http.Client{Timeout: 0}
 	}
-	return doProviderHTTPRequest(_client, _targetReq, providerStreamIdleTimeout(_provider))
+	if err := _provider.Config.CheckScheduledDowntime(); err != nil {
+		return nil, err
+	}
+	return doProviderHTTPRequest(_client, _targetReq, providerStreamIdleTimeout(_provider), _provider.Config)
 }
 
 // -------------------------------------------------------------------------------------

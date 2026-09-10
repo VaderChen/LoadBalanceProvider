@@ -221,6 +221,9 @@ func (_c *Client) TestProviderMinimalChat(_ctx context.Context, _provider *balan
 	if _provider == nil || _provider.Config == nil {
 		return fmt.Errorf("provider is not available for test")
 	}
+	if _provider.Config.InScheduledDowntime(time.Now()) {
+		return fmt.Errorf("來源目前為排程停機時段（Asia/Taipei）")
+	}
 	if _ctx == nil {
 		_ctx = context.Background()
 	}
@@ -238,7 +241,7 @@ func providerShouldRefreshUsage(_provider *balancer.ProviderRuntime) bool {
 	if _provider == nil || _provider.Config == nil {
 		return false
 	}
-	if !_provider.Config.Enabled {
+	if !_provider.Config.AvailableNow() {
 		return false
 	}
 	if strings.EqualFold(strings.TrimSpace(_provider.Config.Role), "classifier") {
@@ -249,6 +252,9 @@ func providerShouldRefreshUsage(_provider *balancer.ProviderRuntime) bool {
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *balancer.ProviderRuntime) error {
+	if err := _provider.Config.CheckScheduledDowntime(); err != nil {
+		return err
+	}
 	_model := providerUsageProbeModelName(_provider.Config)
 	if _model == "" {
 		return fmt.Errorf("provider has no model for codex usage refresh")
@@ -294,7 +300,7 @@ func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *ba
 		_req.Header.Set("chatgpt-account-id", _accountID)
 	}
 
-	_resp, _err := security.GuardedHTTPClient(usageRefreshHTTPClient(_c)).Do(_req)
+	_resp, _err := dispatchProviderHTTP(usageRefreshHTTPClient(_c), _req, _provider.Config)
 	if _err != nil {
 		return _err
 	}
@@ -352,6 +358,9 @@ func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *ba
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) refreshGenericProviderUsageByMinimalRequest(_ctx context.Context, _provider *balancer.ProviderRuntime) error {
+	if err := _provider.Config.CheckScheduledDowntime(); err != nil {
+		return err
+	}
 	_model := providerUsageProbeModelName(_provider.Config)
 	if _model == "" {
 		return fmt.Errorf("provider has no model for usage probe")
@@ -382,7 +391,7 @@ func (_c *Client) refreshGenericProviderUsageByMinimalRequest(_ctx context.Conte
 		_req.Header.Set("Authorization", "Bearer "+_apiKey)
 	}
 
-	_resp, _err := security.GuardedHTTPClient(usageRefreshHTTPClient(_c)).Do(_req)
+	_resp, _err := dispatchProviderHTTP(usageRefreshHTTPClient(_c), _req, _provider.Config)
 	if _err != nil {
 		return _err
 	}

@@ -95,6 +95,13 @@ func SaveProxyConfig(_path string, _config *domain.ProxyConfig) error {
 	}
 
 	ApplyDefaults(_config)
+	for _, provider := range _config.Providers {
+		if provider.Downtime != nil {
+			if err := provider.Downtime.Validate(); err != nil {
+				return fmt.Errorf("provider %s: %w", provider.ID, err)
+			}
+		}
+	}
 
 	_dir := filepath.Dir(_path)
 	if _dir != "." && _dir != "" {
@@ -155,6 +162,9 @@ func ApplyDefaults(_config *domain.ProxyConfig) {
 
 	for _idx := range _config.Providers {
 		_provider := &_config.Providers[_idx]
+		if _provider.Downtime == nil {
+			_provider.Downtime = &domain.ProviderDowntime{Start: "04:00", End: "05:00"}
+		}
 
 		if _provider.ID == "" {
 			_provider.ID = fmt.Sprintf("provider-%d", _idx+1)

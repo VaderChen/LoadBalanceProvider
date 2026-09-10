@@ -31,8 +31,8 @@ func TestReconnectIdentityIsolation(t *testing.T) {
 			t.Fatal("distinct request shared identity")
 		}
 	}
-	if key("anonymous", "", body) != "" || key("key:a", "", `{"input":"hello"}`) != "" {
-		t.Fatal("unidentified requests must not share a content budget")
+	if key("anonymous", "", body) != "" || key("key:a", "", `{"input":"hello"}`) == "" {
+		t.Fatal("僅已驗證請求可使用內容重送識別")
 	}
 }
 

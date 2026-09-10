@@ -988,6 +988,29 @@
         justify-content: flex-end;
       }
     }
+    .downtime-clock {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+    }
+    .downtime-clock select { min-width: 0; padding: 10px 4px; }
+    #downtimeEnabled::before {
+      content: "";
+      display: block;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: white;
+      transition: transform 120ms ease;
+    }
+    #downtimeEnabled:checked { background: #216b50 !important; }
+    #downtimeEnabled:checked::before { transform: translateX(16px); }
+    #downtimeEnabled:focus-visible { outline: 2px solid #216b50; outline-offset: 3px; }
+    @media (prefers-reduced-motion: reduce) {
+      #downtimeEnabled::before { transition: none; }
+    }
   </style>
 </head>
 <body>
@@ -1105,6 +1128,32 @@
                   <option value="high">high</option>
                   <option value="xhigh">xhigh</option>
                 </select>
+              </div>
+            </div>
+          </details>
+
+          <details class="provider-settings">
+            <summary class="provider-settings-summary"><span>每日停機（台北時間）</span></summary>
+            <div class="form-grid provider-settings-fields">
+              <div class="field full">
+                <label for="downtimeEnabled">啟用停機排程</label>
+                <input id="downtimeEnabled" type="checkbox" role="switch" style="appearance:none;width:40px;height:24px;min-height:24px;border-radius:12px;padding:2px;cursor:pointer;background:#ccc" aria-label="啟用停機排程">
+              </div>
+              <div class="field">
+                <label for="downtimeStartHour">開始時間</label>
+                <div class="downtime-clock">
+                  <select id="downtimeStartHour" aria-label="開始時間：時（24 小時制）" required></select>
+                  <span aria-hidden="true">:</span>
+                  <select id="downtimeStartMinute" aria-label="開始時間：分" required></select>
+                </div>
+              </div>
+              <div class="field">
+                <label for="downtimeEndHour">結束時間</label>
+                <div class="downtime-clock">
+                  <select id="downtimeEndHour" aria-label="結束時間：時（24 小時制）" required></select>
+                  <span aria-hidden="true">:</span>
+                  <select id="downtimeEndMinute" aria-label="結束時間：分" required></select>
+                </div>
               </div>
             </div>
           </details>
@@ -1374,10 +1423,33 @@
       chatApi: document.getElementById("chatApi"),
       model: document.getElementById("modelName"),
       maxConcurrent: document.getElementById("maxConcurrent"),
+      downtimeEnabled: document.getElementById("downtimeEnabled"),
+      downtimeStartHour: document.getElementById("downtimeStartHour"),
+      downtimeStartMinute: document.getElementById("downtimeStartMinute"),
+      downtimeEndHour: document.getElementById("downtimeEndHour"),
+      downtimeEndMinute: document.getElementById("downtimeEndMinute"),
       reasoningEffort: document.getElementById("reasoningEffort"),
       responsibility: document.getElementById("responsibility")
     };
     const reasoningEffortField = document.getElementById("reasoningEffortField");
+
+    for (const prefix of ["downtimeStart", "downtimeEnd"]) {
+      for (const [unit, count] of [["Hour", 24], ["Minute", 60]]) {
+        fields[prefix + unit].replaceChildren(...Array.from({ length: count }, (_, i) => {
+          const value = String(i).padStart(2, "0");
+          return new Option(value, value);
+        }));
+      }
+    }
+
+    function updateDowntimeInputs(enabled) {
+      for (const prefix of ["downtimeStart", "downtimeEnd"]) {
+        for (const unit of ["Hour", "Minute"]) fields[prefix + unit].disabled = !enabled;
+      }
+      const same = fields.downtimeStartHour.value === fields.downtimeEndHour.value &&
+        fields.downtimeStartMinute.value === fields.downtimeEndMinute.value;
+      fields.downtimeEndMinute.setCustomValidity(enabled && same ? "開始與結束時間不可相同" : "");
+    }
 
     function createProvider(kind, enabled) {
       const template = providerTemplates[kind];
@@ -1400,6 +1472,7 @@
         responsibility: template.responsibility,
         capabilities: normalizeCapabilities(template.capabilities || ["chat", "reasoning"]),
         enabled,
+        downtime: { enabled: false, start: "04:00", end: "05:00" },
         maxConcurrent: 4,
         priority: providers.length + 1
       };
@@ -1429,6 +1502,11 @@
         responsibility: provider.responsibility || template.responsibility,
         capabilities: normalizeCapabilities(provider.capabilities || template.capabilities || ["chat", "reasoning"]),
         enabled: Boolean(provider.enabled),
+        downtime: {
+          enabled: Boolean(provider.downtime?.enabled),
+          start: provider.downtime?.start || "04:00",
+          end: provider.downtime?.end || "05:00"
+        },
         maxConcurrent: Number(provider.maxConcurrent) || 4,
         priority: Number(provider.priority) || 1
       };
@@ -1700,6 +1778,10 @@
       fields.host.value = provider.host;
       fields.chatApi.value = provider.chatApi;
       fields.maxConcurrent.value = provider.maxConcurrent;
+      fields.downtimeEnabled.checked = provider.downtime.enabled;
+      [fields.downtimeStartHour.value, fields.downtimeStartMinute.value] = provider.downtime.start.split(":");
+      [fields.downtimeEndHour.value, fields.downtimeEndMinute.value] = provider.downtime.end.split(":");
+      updateDowntimeInputs(provider.downtime.enabled);
       fields.reasoningEffort.value = normalizeReasoningEffort(provider.kind, provider.reasoningEffort);
       reasoningEffortField.hidden = false;
       fields.responsibility.value = provider.responsibility || "";
@@ -2173,6 +2255,12 @@
       provider.chatApi = normalizeProviderChatAPI(provider.kind, fields.chatApi.value.trim());
       provider.model = fields.model.value;
       provider.maxConcurrent = Number(fields.maxConcurrent.value) || 1;
+      provider.downtime = {
+        enabled: fields.downtimeEnabled.checked,
+        start: `${fields.downtimeStartHour.value}:${fields.downtimeStartMinute.value}`,
+        end: `${fields.downtimeEndHour.value}:${fields.downtimeEndMinute.value}`
+      };
+      updateDowntimeInputs(provider.downtime.enabled);
       provider.reasoningEffort = normalizeReasoningEffort(provider.kind, fields.reasoningEffort.value);
       provider.responsibility = fields.responsibility.value.trim();
       provider.capabilities = selectedCapabilities();

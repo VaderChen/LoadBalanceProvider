@@ -8,7 +8,7 @@ import (
 func TestOverloadBackoffSharesWindow(t *testing.T) {
 	p := &ProviderRuntime{}
 	first := p.NextOverloadBackoff(0)
-	if first < 2*time.Second || first >= 3*time.Second {
+	if first < 30*time.Second || first >= 31*time.Second {
 		t.Fatalf("first delay = %s", first)
 	}
 	until := p.overloadUntil
@@ -25,7 +25,7 @@ func TestOverloadBackoffSharesWindow(t *testing.T) {
 
 func TestOverloadBackoffEscalatesOnlyAfterWindow(t *testing.T) {
 	p := &ProviderRuntime{}
-	for _, base := range []time.Duration{2, 4, 8, 16, 16} {
+	for _, base := range []time.Duration{30, 60, 90, 90, 90} {
 		p.overloadUntil = time.Now().Add(-time.Second)
 		delay := p.NextOverloadBackoff(0)
 		if delay < base*time.Second || delay >= (base+1)*time.Second {

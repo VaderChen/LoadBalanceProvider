@@ -56,7 +56,7 @@ const (
 	defaultProviderCapacityCooldown = 10 * time.Second
 	// 釘住 provider 的請求只在原帳號上重試，次數刻意保守，避免拖長使用者等待。
 	pinnedProviderMaxRetries   = 2
-	pinnedProviderRetryBackoff = 400 * time.Millisecond
+	pinnedProviderRetryBackoff = 15 * time.Second
 )
 
 // -------------------------------------------------------------------------------------
@@ -90,26 +90,27 @@ type HTTPAPI struct {
 
 // -------------------------------------------------------------------------------------
 type ProviderForm struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
-	Kind            string   `json:"kind"`
-	Role            string   `json:"role,omitempty"`
-	APIKey          string   `json:"apiKey"`
-	APIKeyMasked    string   `json:"apiKeyMasked,omitempty"`
-	HasAPIKey       bool     `json:"hasApiKey"`
-	OAuth           bool     `json:"oauth,omitempty"`
-	OAuthAccount    string   `json:"oauthAccount,omitempty"`
-	Host            string   `json:"host"`
-	ChatAPI         string   `json:"chatApi"`
-	Model           string   `json:"model"`
-	Purpose         string   `json:"purpose"`
-	Scale           string   `json:"scale"`
-	Responsibility  string   `json:"responsibility"`
-	ReasoningEffort string   `json:"reasoningEffort,omitempty"`
-	Capabilities    []string `json:"capabilities,omitempty"`
-	Enabled         bool     `json:"enabled"`
-	MaxConcurrent   int64    `json:"maxConcurrent"`
-	Priority        int      `json:"priority,omitempty"`
+	ID              string                   `json:"id"`
+	Name            string                   `json:"name"`
+	Kind            string                   `json:"kind"`
+	Role            string                   `json:"role,omitempty"`
+	APIKey          string                   `json:"apiKey"`
+	APIKeyMasked    string                   `json:"apiKeyMasked,omitempty"`
+	HasAPIKey       bool                     `json:"hasApiKey"`
+	OAuth           bool                     `json:"oauth,omitempty"`
+	OAuthAccount    string                   `json:"oauthAccount,omitempty"`
+	Host            string                   `json:"host"`
+	ChatAPI         string                   `json:"chatApi"`
+	Model           string                   `json:"model"`
+	Purpose         string                   `json:"purpose"`
+	Scale           string                   `json:"scale"`
+	Responsibility  string                   `json:"responsibility"`
+	ReasoningEffort string                   `json:"reasoningEffort,omitempty"`
+	Capabilities    []string                 `json:"capabilities,omitempty"`
+	Enabled         bool                     `json:"enabled"`
+	Downtime        *domain.ProviderDowntime `json:"downtime,omitempty"`
+	MaxConcurrent   int64                    `json:"maxConcurrent"`
+	Priority        int                      `json:"priority,omitempty"`
 }
 
 // -------------------------------------------------------------------------------------
@@ -2711,7 +2712,7 @@ func (_h *HTTPAPI) handleStartIntelligenceBenchmark(_w http.ResponseWriter, _bod
 		_h.writeJSON(_w, http.StatusNotFound, domain.ErrorResponse("not_found", "provider config not found"))
 		return
 	}
-	if !_provider.Enabled {
+	if !_provider.AvailableNow() {
 		_h.writeJSON(_w, http.StatusBadRequest, domain.ErrorResponse("invalid_request_error", "provider is disabled"))
 		return
 	}
@@ -2871,6 +2872,11 @@ func (_h *HTTPAPI) handleDeleteProviderConfig(_w http.ResponseWriter, _id string
 
 // -------------------------------------------------------------------------------------
 func validateProviderOutboundURL(_provider domain.LLMProviderConfig) error {
+	if _provider.Downtime != nil {
+		if err := _provider.Downtime.Validate(); err != nil {
+			return err
+		}
+	}
 	if strings.TrimSpace(_provider.BaseURL) == "" {
 		return fmt.Errorf("provider host is empty")
 	}
@@ -3030,6 +3036,7 @@ func (_h *HTTPAPI) saveAndReload(_w http.ResponseWriter, _proxyConfig *domain.Pr
 
 // -------------------------------------------------------------------------------------
 func (_h *HTTPAPI) handleChatCompletions(_w http.ResponseWriter, _r *http.Request, _body []byte) {
+	_r = withReconnectIdentity(_r, _body)
 	if _h.Balancer == nil || _h.Client == nil {
 		_h.writeJSON(_w, http.StatusServiceUnavailable, domain.ErrorResponse("service_unavailable", "proxy service is not initialized"))
 		return
@@ -3538,7 +3545,37 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_budget.round = _shared.round
 	}
 
+	_nextDispatchAt := time.Time{}
+	_ordinaryFailures := 0
+	if _shared != nil {
+		_nextDispatchAt = _shared.nextDispatchAt
+		_ordinaryFailures = _shared.ordinaryFailures
+	}
 	for _attempt := 0; _attempt <= _maxRetries; _attempt++ {
+		if wait := time.Until(_nextDispatchAt); wait > 0 {
+			_remaining := time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second - _waitedForCooldown
+			if _headersSent {
+				_budgetWriter.AdoptCommitted()
+			}
+			elapsed, ready, waitErr := waitForProviderCooldownResult(_r.Context(), _budgetWriter, _budgetHeartbeat, &balancer.NoAvailableProviderError{TemporaryOverload: true, RetryAfter: wait}, _remaining)
+			_waitedForCooldown += elapsed
+			if _shared != nil {
+				_shared.waited = _waitedForCooldown
+			}
+			_headersSent = _headersSent || _budgetWriter.Committed()
+			if waitErr != nil {
+				return
+			}
+			if !ready {
+				seconds := max(1, int(time.Until(_nextDispatchAt).Seconds()+1))
+				_w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				err := fmt.Errorf("代理重試間隔尚未結束，約 %d 秒後再試", seconds)
+				if !_h.writeGracefulStreamTerminal(_w, _budgetWriter, _request.Stream, _refusalTerminal, err) {
+					_h.writeJSON(_w, http.StatusTooManyRequests, domain.ErrorResponse("retry_interval", err.Error()))
+				}
+				return
+			}
+		}
 		_budget.failed = _h.recoveryLimits.failedProviders(_turnRecoveryKey)
 		_target, _model, _profile, _selectionMeta, _err := _h.selectRetryProvider(&_request, &_budget)
 		var _finishModel func(bool, bool)
@@ -3790,6 +3827,15 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 				_shared.rebindFrom = _target.Config.ID
 			}
 			log.Printf("provider capacity rebind prepared: trace=%s from=%s attempts_preserved=true", _trace, _target.Config.ID)
+			_nextDispatchAt = time.Now().Add(30 * time.Second)
+		}
+		if !_failurePolicy.Capacity && !_failurePolicy.RetryableServer && providerFailureCanRetryBeforeFirstToken(_forwardErr, _deferred) {
+			_ordinaryFailures = min(_ordinaryFailures+1, 4)
+			_nextDispatchAt = time.Now().Add(time.Duration(_ordinaryFailures) * pinnedProviderRetryBackoff)
+		}
+		if _shared != nil {
+			_shared.nextDispatchAt = _nextDispatchAt
+			_shared.ordinaryFailures = _ordinaryFailures
 		}
 		_recoveryRemaining := time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second - _waitedForCooldown
 		if _attempt >= _maxRetries && _failurePolicy.RetryableServer && providerFailureCanRetryBeforeFirstToken(_forwardErr, _deferred) && canContinueRecoveryProbe(_shared, _deferred, _recoveryProbeUsed, _recoveryRemaining) && _h.recoveryLimits.checkTurn(_turnRecoveryKey, false, true) == nil {
@@ -3847,9 +3893,6 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 
 		if _pinnedProvider {
 			// 其餘暫時性故障：保留原 provider，短暫退避讓它有機會恢復。
-			if !_failurePolicy.Capacity && !_failurePolicy.RetryableServer && !waitBeforeRetry(_r.Context(), _attempt) {
-				return
-			}
 			continue
 		}
 	}
@@ -3957,7 +4000,7 @@ func (_h *HTTPAPI) conversationPinIsReleasable(_r *http.Request) bool {
 // -------------------------------------------------------------------------------------
 // waitBeforeRetry 在重試同一個 provider 前做短暫退避。回傳 false 代表請求已被取消。
 func waitBeforeRetry(_ctx context.Context, _attempt int) bool {
-	_delay := time.Duration(_attempt+1) * pinnedProviderRetryBackoff
+	_delay := time.Duration(min(_attempt+1, 4)) * pinnedProviderRetryBackoff
 	_timer := time.NewTimer(_delay)
 	defer _timer.Stop()
 	select {
@@ -4442,7 +4485,7 @@ func recordProviderForwardFailure(_provider *balancer.ProviderRuntime, _err erro
 	if _provider == nil || _err == nil {
 		return
 	}
-	if errors.Is(_err, context.Canceled) || (_request != nil && _request.Context().Err() != nil) {
+	if errors.Is(_err, domain.ErrProviderScheduledDowntime) || errors.Is(_err, context.Canceled) || (_request != nil && _request.Context().Err() != nil) {
 		return
 	}
 	if proxy.IsUpstreamRequestRejected(_err) {
@@ -5153,6 +5196,7 @@ func providerConfigToForm(_provider domain.LLMProviderConfig) ProviderForm {
 		ReasoningEffort: normalizeReasoningEffortForKind(inferProviderKind(_provider), _provider.ReasoningEffort),
 		Capabilities:    normalizeCapabilities(_capabilities),
 		Enabled:         _provider.Enabled,
+		Downtime:        _provider.Downtime,
 		MaxConcurrent:   _provider.MaxConcurrent,
 		Priority:        _provider.Priority,
 	}
@@ -5195,6 +5239,7 @@ func formToProviderConfig(_form ProviderForm) domain.LLMProviderConfig {
 		APIKey:              _form.APIKey,
 		ChatCompletionsPath: defaultString(_form.ChatAPI, "/v1/chat/completions"),
 		Enabled:             _form.Enabled,
+		Downtime:            _form.Downtime,
 		Weight:              10,
 		Priority:            positiveInt(_form.Priority, 1),
 		TimeoutSeconds:      domain.DefaultProviderTimeoutSeconds,
@@ -5220,6 +5265,9 @@ func formToProviderConfig(_form ProviderForm) domain.LLMProviderConfig {
 // -------------------------------------------------------------------------------------
 func mergeProviderConfig(_old domain.LLMProviderConfig, _form ProviderForm) domain.LLMProviderConfig {
 	_updated := formToProviderConfig(_form)
+	if _form.Downtime == nil {
+		_updated.Downtime = _old.Downtime
+	}
 
 	_updated.APIKeyEnv = _old.APIKeyEnv
 	if _updated.APIKey == "" {

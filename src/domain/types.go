@@ -83,25 +83,26 @@ type ProxyConfig struct {
 
 // -------------------------------------------------------------------------------------
 type LLMProviderConfig struct {
-	ID                  string           `json:"id"`
-	Name                string           `json:"name"`
-	Kind                string           `json:"kind,omitempty"`
-	Type                string           `json:"type"`
-	Role                string           `json:"role,omitempty"`
-	BaseURL             string           `json:"base_url"`
-	APIKey              string           `json:"api_key"`
-	APIKeyEnv           string           `json:"api_key_env"`
-	ChatCompletionsPath string           `json:"chat_completions_path"`
-	Enabled             bool             `json:"enabled"`
-	Weight              int              `json:"weight"`
-	Priority            int              `json:"priority"`
-	TimeoutSeconds      int              `json:"timeout_seconds"`
-	MaxConcurrent       int64            `json:"max_concurrent"`
-	Models              []LLMModelConfig `json:"models"`
-	Purpose             string           `json:"purpose,omitempty"`
-	Scale               string           `json:"scale,omitempty"`
-	Responsibility      string           `json:"responsibility,omitempty"`
-	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
+	ID                  string            `json:"id"`
+	Name                string            `json:"name"`
+	Kind                string            `json:"kind,omitempty"`
+	Type                string            `json:"type"`
+	Role                string            `json:"role,omitempty"`
+	BaseURL             string            `json:"base_url"`
+	APIKey              string            `json:"api_key"`
+	APIKeyEnv           string            `json:"api_key_env"`
+	ChatCompletionsPath string            `json:"chat_completions_path"`
+	Enabled             bool              `json:"enabled"`
+	Downtime            *ProviderDowntime `json:"downtime,omitempty"`
+	Weight              int               `json:"weight"`
+	Priority            int               `json:"priority"`
+	TimeoutSeconds      int               `json:"timeout_seconds"`
+	MaxConcurrent       int64             `json:"max_concurrent"`
+	Models              []LLMModelConfig  `json:"models"`
+	Purpose             string            `json:"purpose,omitempty"`
+	Scale               string            `json:"scale,omitempty"`
+	Responsibility      string            `json:"responsibility,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
 }
 
 // -------------------------------------------------------------------------------------

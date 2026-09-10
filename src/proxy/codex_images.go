@@ -245,7 +245,10 @@ func (_c *Client) requestCodexGeneratedImage(_ctx context.Context, _srcReq *http
 	if _client == nil {
 		_client = &http.Client{Timeout: 0}
 	}
-	_response, _err := security.GuardedHTTPClient(_client).Do(_request)
+	if err := _provider.Config.CheckScheduledDowntime(); err != nil {
+		return codexImageResult{}, 0, err
+	}
+	_response, _err := dispatchProviderHTTP(_client, _request, _provider.Config)
 	if _err != nil {
 		return codexImageResult{}, 0, _err
 	}
