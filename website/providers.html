@@ -1067,7 +1067,7 @@
             </div>
           </div>
 
-          <details class="provider-settings" open>
+          <details class="provider-settings">
             <summary class="provider-settings-summary"><span>連線與模型設定</span></summary>
             <div class="form-grid provider-settings-fields">
               <div class="field full">
@@ -1081,6 +1081,7 @@
                   <input id="chatApi" name="chatApi" autocomplete="off">
                   <button class="check-button" type="button" id="validateButton" title="檢查 Chat API" aria-label="檢查 Chat API">✓</button>
                 </div>
+                <div id="validateResult" role="status" style="font-size:12px;overflow-wrap:anywhere;white-space:pre-wrap" hidden></div>
               </div>
 
               <div class="field">
@@ -1109,7 +1110,7 @@
           </details>
 
           <div class="reset-credit-panel" id="resetCreditPanel" hidden>
-            <details class="reset-credit-details" open>
+            <details class="reset-credit-details">
               <summary class="reset-credit-summary">
                 <span class="reset-credit-label">使用量限制重設</span>
                 <span class="reset-credit-count" id="resetCreditCount" aria-live="polite">載入中...</span>
@@ -1119,7 +1120,7 @@
             <div class="reset-credit-status" id="resetCreditStatus" aria-live="polite"></div>
           </div>
 
-          <details class="provider-settings" id="billingPanel" open hidden>
+          <details class="provider-settings" id="billingPanel" hidden>
             <summary class="provider-settings-summary"><span>帳單列表</span></summary>
             <div class="billing-toolbar">
               <button class="text-button" type="button" id="billingQuery">查詢</button>
@@ -2578,12 +2579,18 @@
     });
 
     validateButton.addEventListener("click", async () => {
+      if (validateButton.disabled) return;
       const provider = currentProvider();
       if (!provider) {
         return;
       }
 
       syncFromForm();
+      validateButton.disabled = true;
+      const result = document.getElementById("validateResult");
+      result.hidden = false;
+      result.textContent = "測試中…";
+      let message = "請確認 HOST 與 Chat API 路徑。";
       let ok = provider.host.length > 0 && provider.chatApi.startsWith("/");
       if (ok) {
         try {
@@ -2591,13 +2598,17 @@
           render();
           const payload = await apiRequest(`api/provider-configs/${encodeURIComponent(saved.id)}/test`, { method: "POST" });
           ok = Boolean(payload.ok);
+          message = ok ? (payload.warning ? `對話測試成功；模型清單：${payload.warning}` : "對話測試成功") : (payload.message || "對話測試失敗");
           if (ok) {
             await refreshProviderAfterSuccess(saved.id);
           }
         } catch (_err) {
           ok = false;
+          message = _err.message || "對話測試失敗";
         }
       }
+      result.textContent = message;
+      result.style.color = ok ? "#287d58" : "#b34233";
       await showValidateAnimation(ok);
     });
 

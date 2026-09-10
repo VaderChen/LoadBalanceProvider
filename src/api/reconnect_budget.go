@@ -37,7 +37,8 @@ func withReconnectIdentity(r *http.Request, body []byte) *http.Request {
 	}
 	identity, _ := json.Marshal([]string{owner, r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("X-Proxy-Turn-ID"), string(canonical)})
 	key := fmt.Sprintf("%x", sha256.Sum256(identity))
-	return r.WithContext(context.WithValue(r.Context(), reconnectIdentityKey{}, key))
+	ctx := context.WithValue(r.Context(), turnRecoveryKey{}, responseTurnRoute(body, r))
+	return r.WithContext(context.WithValue(ctx, reconnectIdentityKey{}, key))
 }
 
 type reconnectBudgetStore struct {
@@ -50,6 +51,7 @@ type reconnectBudget struct {
 	active          bool
 	expires         time.Time
 	retryAt         time.Time
+	waitRetryAt     time.Time
 	attempts        int
 	limit           int
 	waited          time.Duration
@@ -61,6 +63,7 @@ type reconnectBudget struct {
 	probeAttempts   int
 	probeWindowAt   time.Time
 	round           int
+	recoveryUsed    bool
 }
 
 type reconnectRejection struct {
@@ -71,7 +74,7 @@ type reconnectRejection struct {
 }
 
 func (r *reconnectRejection) canWaitForRecovery() bool {
-	return r != nil && !r.retryAt.IsZero() && (r.code == "request_retry_exhausted" || r.code == "request_probe_throttled")
+	return r != nil && !r.retryAt.IsZero() && (r.code == "request_retry_exhausted" || r.code == "request_probe_throttled" || r.code == "request_wait_throttled")
 }
 
 func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget, *reconnectRejection) {
@@ -95,6 +98,11 @@ func (s *reconnectBudgetStore) acquire(key string, limit int) (*reconnectBudget,
 			return nil, &reconnectRejection{status: http.StatusBadRequest, code: "request_replay_unsafe", message: "此請求已交付完整工具呼叫後中斷，不自動重播；請確認工具結果並提出新的接續請求"}
 		}
 		entry.limit = min(entry.limit, limit)
+		if now.Before(entry.waitRetryAt) {
+			seconds := int((entry.waitRetryAt.Sub(now) + time.Second - 1) / time.Second)
+			return nil, &reconnectRejection{status: http.StatusTooManyRequests, retryAfter: seconds, retryAt: entry.waitRetryAt, code: "request_wait_throttled", message: fmt.Sprintf("等待額度暫時用盡，約 %d 秒後恢復；原 Provider 的冷卻仍須等待", seconds)}
+		}
+		entry.waitRetryAt = time.Time{}
 		// 退款不清除實際探測紀錄；短窗口結束後再放行，不延長既定期限。
 		if !entry.probeWindowAt.IsZero() && !now.Before(entry.probeWindowAt.Add(reconnectRetryCooldown)) {
 			entry.probeAttempts = 0

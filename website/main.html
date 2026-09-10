@@ -5,7 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LLM Proxy 儀表版</title>
   <script src="i18n.js"></script>
+  <script defer src="vendor/lucide.min.js" onload="lucide.createIcons()"></script>
+  <script defer src="settings-tooltips.js"></script>
   <style>
+    .parameter-help {
+      width: fit-content;
+      max-width: 100%;
+      cursor: help;
+      text-decoration: underline dotted #999;
+      text-underline-offset: 4px;
+    }
+    .parameter-help:focus-visible {
+      outline: 2px solid #377ba5;
+      outline-offset: 3px;
+    }
+    .parameter-tooltip {
+      position: fixed;
+      inset: auto;
+      margin: 0;
+      z-index: 10000;
+      width: 320px;
+      max-width: calc(100vw - 16px);
+      max-height: calc(100dvh - 16px);
+      overflow: auto;
+      padding: 10px 12px;
+      border: 1px solid #d0d5d2;
+      border-radius: 6px;
+      background: #fff;
+      color: #252a27;
+      box-shadow: 0 4px 16px #0002;
+      font-size: 13px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+    .parameter-tooltip[hidden] { display: none; }
     :root {
       --bg: #fafafa;
       --panel: #ffffff;
@@ -629,6 +662,33 @@
       display: block;
       scrollbar-width: none;
       -ms-overflow-style: none;
+    }
+
+    body:has(#chatView.active) {
+      height: 100dvh;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    body:has(#chatView.active) > .topbar {
+      flex: none;
+      max-height: 35dvh;
+      overflow: auto;
+    }
+
+    body:has(#chatView.active) > main {
+      flex: 1;
+      min-height: 0;
+      margin: 8px auto 0;
+    }
+
+    #chatView.active,
+    #chatView .embedded-frame {
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
     }
 
     .placeholder-panel {
@@ -1747,6 +1807,10 @@
         <svg viewBox="0 0 24 24"><path d="M12 4v16"></path><path d="M6 8h12"></path><path d="M6 16h12"></path><path d="M8 4h8"></path><path d="M8 20h8"></path></svg>
         模型來源
       </a>
+      <a class="nav-link" href="#chat" data-view="chatView">
+        <i data-lucide="messages-square" aria-hidden="true"></i>
+        測試對話
+      </a>
       <a class="nav-link" href="#benchmark" data-view="benchmarkView">
         <svg viewBox="0 0 24 24"><path d="M4 14a8 8 0 0 1 16 0"></path><path d="M12 14l4-4"></path><path d="M5 19h14"></path></svg>
         基準測試
@@ -1879,6 +1943,9 @@
       <iframe class="embedded-frame" title="模型來源" data-src="providers.html" loading="lazy"></iframe>
     </section>
 
+    <section class="view" id="chatView">
+      <iframe class="embedded-frame" title="測試對話" data-src="chat.html?v=sse-content-2" loading="lazy"></iframe>
+    </section>
     <section class="view" id="benchmarkView">
       <iframe class="embedded-frame" title="基準測試" data-src="benchmark.html" loading="lazy"></iframe>
     </section>
@@ -2104,7 +2171,6 @@
                       <input class="text-input" id="maxBindingsPerProvider" type="number" min="1" max="1000" step="1" inputmode="numeric">
                     </label>
                   </div>
-                  <p class="settings-parameter-note">route 存在時會優先沿用原 Provider；route 遺失、過期、配額差超過容忍值，或原 Provider 正在容量冷卻中時，會移除舊 continuity 後重新負載平衡。容量冷卻是上游回報限流／容量錯誤後暫停選用該 Provider 的秒數，調短可減少對話被迫降級的機會。綁定上限是單一 Provider 可同時承載的對話數，達標後新對話會改用其他 Provider；既有綁定不受影響，全部達標時仍會照常選用。設定儲存後立即生效。</p>
                   <div class="settings-actions">
                     <button class="soft-button" type="button" id="reloadAdvancedButton">重新載入</button>
                     <button class="primary-button" type="button" id="saveAdvancedButton">儲存參數</button>
@@ -5002,6 +5068,7 @@
     function initialViewId() {
       if (window.location.hash === "#providers") return "providersView";
       if (window.location.hash === "#benchmark") return "benchmarkView";
+      if (window.location.hash === "#chat") return "chatView";
       if (window.location.hash === "#system-monitor") return "systemMonitorView";
       if (window.location.hash === "#usage-density") return "usageDensityView";
       if (window.location.hash === "#keys") return "keysView";

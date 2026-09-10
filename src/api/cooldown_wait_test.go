@@ -22,8 +22,8 @@ func TestCooldownWaitBudgetAndCancelSmoke(t *testing.T) {
 	if !ready || spent < err.RetryAfter || !r.Flushed || w.ContentWritten() {
 		t.Fatalf("invalid keepalive wait: %v %v", spent, ready)
 	}
-	if _, ready := waitForProviderCooldown(context.Background(), w, []byte(": ping\n\n"), err, time.Millisecond); ready {
-		t.Fatal("exceeded budget")
+	if spent, ready := waitForProviderCooldown(context.Background(), w, []byte(": ping\n\n"), err, time.Millisecond); ready || spent < time.Millisecond {
+		t.Fatal("較長冷卻應有限等待，不提前放行或立即退出")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

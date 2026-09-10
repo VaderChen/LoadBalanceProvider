@@ -18,10 +18,11 @@ func (h *HTTPAPI) acquireReconnectBudget(ctx context.Context, key string, limit 
 		if rejection == nil || !rejection.canWaitForRecovery() || writer.ContentWritten() {
 			return entry, rejection, nil
 		}
-		if budget <= 0 || rejection.retryAt.After(deadline) {
+		remaining := time.Until(deadline)
+		if budget <= 0 || remaining <= 0 {
 			return nil, rejection, nil
 		}
-		wait := time.Until(rejection.retryAt)
+		wait := min(time.Until(rejection.retryAt), remaining)
 		log.Printf("provider replay cooldown wait: trace=%s reason=%s wait=%s", trace, rejection.code, wait.Round(time.Millisecond))
 		if _, err := waitWithStreamHeartbeat(ctx, writer, heartbeat, wait); err != nil {
 			return nil, nil, err

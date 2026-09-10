@@ -1504,9 +1504,7 @@ func (_r *streamIdleTimeoutReader) MarkStreamActivity(_eventType string) {
 		return
 	}
 	_eventType = strings.TrimSpace(_eventType)
-	if strings.EqualFold(_eventType, "comment") || IsSSEHeartbeatEvent(_eventType) {
-		return
-	}
+	// 上游心跳也是連線活動；是否產出內容仍由獨立的交付判準決定。
 	if _eventType == "" {
 		_eventType = "sse-event"
 	}

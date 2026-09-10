@@ -89,17 +89,17 @@ func TestProviderHeaderTimeoutDoesNotLimitBodySmoke(t *testing.T) {
 	}
 }
 
-func TestProviderHeartbeatDoesNotResetIdleSmoke(t *testing.T) {
+func TestProviderHeartbeatResetsIdleSmoke(t *testing.T) {
 	r, w := io.Pipe()
 	defer w.Close()
-	idle := newStreamIdleTimeoutReader(r, 40*time.Millisecond)
+	idle := newStreamIdleTimeoutReader(r, time.Minute)
 	defer idle.Close()
-	for i := 0; i < 6; i++ {
-		idle.MarkStreamActivity("ping")
-		idle.MarkStreamActivity("comment")
-		time.Sleep(15 * time.Millisecond)
-	}
-	if !idle.timedOut.Load() {
-		t.Fatal("heartbeats extended progress deadline")
+	for _, event := range []string{"keepalive", "ping", "response.ping", "heartbeat", "keep-alive", "comment"} {
+		before := time.Now().Add(-time.Second).UnixNano()
+		idle.lastActivity.Store(before)
+		idle.MarkStreamActivity(event)
+		if idle.lastActivity.Load() <= before || idle.LastEventType() != event {
+			t.Fatalf("upstream heartbeat did not reset idle timer: %s", event)
+		}
 	}
 }

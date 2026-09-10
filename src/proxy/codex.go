@@ -19,7 +19,7 @@ import (
 // -------------------------------------------------------------------------------------
 const defaultOpenAICodexAPIResponsesURL = "https://api.openai.com/v1/responses"
 const defaultOpenAICodexOAuthResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
-const defaultCodexClientVersion = "0.153.0"
+const defaultCodexClientVersion = "0.153.4"
 const defaultCodexUpstreamUserAgent = "codex-tui/" + defaultCodexClientVersion + " (Mac OS; arm64)"
 const defaultCodexUpstreamOriginator = "codex-tui"
 
@@ -329,6 +329,10 @@ func applyCodexUpstreamHeaders(_srcReq *http.Request, _targetReq *http.Request, 
 
 // -------------------------------------------------------------------------------------
 func buildCodexResponsesRequest(_chatReq *domain.ChatCompletionRequest, _model string, _provider *domain.LLMProviderConfig) codexResponsesRequest {
+	return buildCodexResponsesRequestWithDefaults(_chatReq, _model, _provider, true)
+}
+
+func buildCodexResponsesRequestWithDefaults(_chatReq *domain.ChatCompletionRequest, _model string, _provider *domain.LLMProviderConfig, _addInstructions bool) codexResponsesRequest {
 	messages := []codexResponsesMessage{}
 	instructions := []string{}
 	hasImage := false
@@ -391,10 +395,10 @@ func buildCodexResponsesRequest(_chatReq *domain.ChatCompletionRequest, _model s
 		messages = append(messages, codexResponsesMessage{Type: "message", Role: "user", Content: []codexResponsesContentPart{{Type: "input_text", Text: ""}}})
 	}
 	instructionText := strings.TrimSpace(strings.Join(instructions, "\n\n"))
-	if instructionText == "" {
+	if _addInstructions && instructionText == "" {
 		instructionText = "你是 OpenAI Codex 驅動的助理。請直接根據使用者輸入完成任務。"
 	}
-	if hasImage {
+	if _addInstructions && hasImage {
 		instructionText = strings.TrimSpace(instructionText + "\n\nCurrent user turn includes attached media. Analyze the media attached to the current user turn directly. Do not infer current media availability from previous assistant messages.")
 	}
 	return codexResponsesRequest{

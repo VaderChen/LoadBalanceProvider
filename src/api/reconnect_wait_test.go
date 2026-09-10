@@ -112,7 +112,7 @@ func TestReconnectWaitHonorsBoundsAndToolSafety(t *testing.T) {
 			if mode != "in_progress" {
 				h.reconnectBudgets.release("bounded", entry, false)
 			}
-			budget := time.Second
+			budget := 10 * time.Millisecond
 			if mode == "no_wait" {
 				budget = 0
 			}
@@ -125,7 +125,7 @@ func TestReconnectWaitHonorsBoundsAndToolSafety(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			w := newDeferredResponseWriter(recorder, true)
 			probe, rejection, err := h.acquireReconnectBudget(context.Background(), "bounded", 3, w, proxy.ResponsesStreamHeartbeat(), budget, "test")
-			if err != nil || probe != nil || rejection == nil || rejection.code != want || w.Committed() || recorder.Body.Len() != 0 {
+			if err != nil || probe != nil || rejection == nil || rejection.code != want || w.Committed() != (mode == "over_budget") || w.ContentWritten() {
 				t.Fatalf("越過等待或工具安全限制: %v %+v", err, rejection)
 			}
 		})

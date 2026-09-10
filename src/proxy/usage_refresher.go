@@ -218,7 +218,7 @@ func followingProviderUsageBoundary(_boundaryAt time.Time, _wasStart bool) (time
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) TestProviderMinimalChat(_ctx context.Context, _provider *balancer.ProviderRuntime) error {
-	if !providerShouldRefreshUsage(_provider) {
+	if _provider == nil || _provider.Config == nil {
 		return fmt.Errorf("provider is not available for test")
 	}
 	if _ctx == nil {
@@ -254,7 +254,7 @@ func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *ba
 		return fmt.Errorf("provider has no model for codex usage refresh")
 	}
 
-	_auth, _err := codexauth.Ensure(_provider.Config.ID)
+	_auth, _err := codexauth.EnsureContext(_ctx, _provider.Config.ID)
 	if _err != nil {
 		_provider.MarkAuthError(_err.Error())
 		return fmt.Errorf("openai codex oauth unavailable: %w", _err)
@@ -301,7 +301,13 @@ func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *ba
 	defer _resp.Body.Close()
 
 	_provider.RecordUsageHeaders(_resp.Header)
-	_raw, _ := io.ReadAll(io.LimitReader(_resp.Body, 1024*1024))
+	_raw, _readErr := io.ReadAll(io.LimitReader(_resp.Body, 1024*1024+1))
+	if _readErr != nil {
+		return fmt.Errorf("讀取上游測試回應失敗: %w", _readErr)
+	}
+	if len(_raw) > 1024*1024 {
+		return fmt.Errorf("上游測試回應超過 1 MiB 限制")
+	}
 	if usageProbeHasAuthError(_resp.StatusCode, _raw) {
 		_message := usageProbeAuthErrorMessage(_resp.StatusCode, _raw)
 		_provider.MarkAuthError(_message)
@@ -311,6 +317,35 @@ func (_c *Client) testOpenAICodexMinimalChat(_ctx context.Context, _provider *ba
 		return fmt.Errorf("codex usage refresh returned status %d: %s", _resp.StatusCode, strings.TrimSpace(string(_raw)))
 	}
 
+	_completed := false
+	_pending := string(_raw)
+	for {
+		_event, _remaining, _ok := nextSSEEvent(_pending)
+		if !_ok {
+			break
+		}
+		_pending = _remaining
+		_name, _payload := codexSSEEventNameAndPayload(_event)
+		if _payload == "" || _payload == "[DONE]" {
+			continue
+		}
+		var _data map[string]interface{}
+		if json.Unmarshal([]byte(_payload), &_data) != nil || _data == nil {
+			return fmt.Errorf("上游測試串流事件格式不正確")
+		}
+		if _type, _ok := _data["type"].(string); _ok && _type != "" {
+			_name = _type
+		}
+		if _name == "error" || _name == "response.failed" || _name == "response.incomplete" || _data["error"] != nil {
+			return fmt.Errorf("上游測試失敗: %s", codexEventErrorMessage(_data))
+		}
+		if _name == "response.completed" {
+			_completed = true
+		}
+	}
+	if !_completed {
+		return fmt.Errorf("上游測試串流未收到 response.completed，不能判定成功")
+	}
 	_provider.ClearAuthError()
 	return nil
 }

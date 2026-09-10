@@ -61,6 +61,7 @@ const (
 
 // -------------------------------------------------------------------------------------
 type HTTPAPI struct {
+	recoveryLimits         recoveryLimits
 	reconnectBudgets       reconnectBudgetStore
 	activeResponseRequests sync.Map
 	updateRouteRestore     sync.Once
@@ -527,6 +528,10 @@ func (_h *HTTPAPI) Process(_w http.ResponseWriter, _r *http.Request, _jwt *MarsJ
 
 	case _r.Method == http.MethodDelete && (strings.HasPrefix(_route, "/api/provider-configs/") || strings.HasPrefix(_route, "/v1/provider-configs/")):
 		_h.handleDeleteProviderConfig(_w, providerIDFromRoute(_route))
+		return responseHandled()
+
+	case _r.Method == http.MethodPost && _route == "/api/diagnostics/chat":
+		_h.handleDiagnosticChat(_w, _r, []byte(_body))
 		return responseHandled()
 
 	case _r.Method == http.MethodPost && (_route == "/v1/chat/completions" || _route == "/api/v1/chat/completions"):
@@ -3046,7 +3051,7 @@ func (_h *HTTPAPI) handleChatCompletions(_w http.ResponseWriter, _r *http.Reques
 	_releaseContinuity := func(string) bool {
 		return strings.TrimSpace(_chatReq.ProviderID) == "" && strings.TrimSpace(_chatReq.Provider) == ""
 	}
-	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ChatRefusalTerminal, proxy.ChatRefusalTerminal, proxy.ChatStreamHeartbeat(), _releaseContinuity, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
+	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ChatRefusalTerminal, proxy.ChatRefusalTerminal, proxy.ChatStreamHeartbeat(), _releaseContinuity, nil, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
 		return _h.Client.ForwardChatCompletion(_ctx, _attemptWriter, _r, _target, _model, &_chatReq, _body, _profile, _selectionMeta)
 	})
 }
@@ -3138,7 +3143,7 @@ func (_h *HTTPAPI) handleResponsesProxy(_w http.ResponseWriter, _r *http.Request
 		_r = _r.WithContext(context.WithValue(_r.Context(), turnRecoveryContextKey{}, true))
 		return true
 	}
-	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ResponsesFailureTerminal, proxy.ResponsesRefusalTerminal, proxy.ResponsesStreamHeartbeat(), _releaseContinuity, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
+	_prepare := func(_target *balancer.ProviderRuntime, _model *domain.LLMModelConfig) error {
 		var err error
 		if _rebindFrom != "" {
 			err = _h.rebindTurnBeforeDispatch(_turnRoute, _r, _rebindFrom, _target.Config.ID, _model.Name)
@@ -3146,12 +3151,15 @@ func (_h *HTTPAPI) handleResponsesProxy(_w http.ResponseWriter, _r *http.Request
 			err = _h.bindTurnBeforeDispatch(_turnRoute, _r, _target.Config.ID, _model.Name)
 		}
 		if err != nil {
-			return proxy.ChatMetrics{}, turnError(err.Error())
+			return turnError(err.Error())
 		}
 		if _rebindFrom != "" {
 			_h.Client.RecordPromptCacheRoute(proxy.PromptCacheRouteID(proxy.PromptCacheKeyFromBody(_body)), _target.Config.ID, _model.Name, proxy.ResponseRouteOwner(_r))
 		}
 		_rebindFrom = ""
+		return nil
+	}
+	_h.executeProviderRequest(_w, _r, _chatReq, _started, _requestSignals, proxy.ResponsesFailureTerminal, proxy.ResponsesRefusalTerminal, proxy.ResponsesStreamHeartbeat(), _releaseContinuity, _prepare, func(_ctx context.Context, _attemptWriter http.ResponseWriter, _target *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) (proxy.ChatMetrics, error) {
 		_metrics, _forwardErr := _h.Client.ForwardResponses(_ctx, _attemptWriter, _r, _target, _model, _body, _profile, _selectionMeta)
 		_routes := make(map[string]proxy.ResponseRouteTarget)
 		_h.Client.ResponseRoutes.Range(func(key, value interface{}) bool {
@@ -3434,7 +3442,7 @@ func startRetryKeepalive(_ctx context.Context, _deferred *deferredResponseWriter
 type providerForwardAttempt func(context.Context, http.ResponseWriter, *balancer.ProviderRuntime, *domain.LLMModelConfig, domain.RequestProfile, balancer.SelectionMeta) (proxy.ChatMetrics, error)
 
 // -------------------------------------------------------------------------------------
-func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Request, _request domain.ChatCompletionRequest, _started time.Time, _signals telemetry.RequestSignals, _refusalTerminal func(string) []byte, _throttleTerminal func(string) []byte, _heartbeat []byte, _releaseContinuity func(string) bool, _forward providerForwardAttempt) {
+func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Request, _request domain.ChatCompletionRequest, _started time.Time, _signals telemetry.RequestSignals, _refusalTerminal func(string) []byte, _throttleTerminal func(string) []byte, _heartbeat []byte, _releaseContinuity func(string) bool, _prepare func(*balancer.ProviderRuntime, *domain.LLMModelConfig) error, _forward providerForwardAttempt) {
 	_trace := newRequestDiagnosticID()
 	_w.Header().Set("X-Proxy-Request-ID", _trace)
 	// 綁定請求維持較小的重試預算；容量備援也不能突破此上限。
@@ -3444,6 +3452,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_maxRetries = pinnedProviderMaxRetries
 	}
 	_reconnectKey, _ := _r.Context().Value(reconnectIdentityKey{}).(string)
+	_turnRecoveryKey, _ := _r.Context().Value(turnRecoveryKey{}).(string)
 	_retrySettings := _h.currentAdvancedSettings()
 	_headersSent, _ := _r.Context().Value(turnGateHeadersKey{}).(bool)
 	_budgetWriter := newDeferredResponseWriter(_w, _request.Stream)
@@ -3496,6 +3505,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		if _shared.provider != "" {
 			if (_request.ProviderID != "" && _request.ProviderID != _shared.provider) || (_request.Provider != "" && _request.Provider != _shared.provider) {
 				_routeErr := errors.New("重連請求與原 Provider 不一致，未送往上游")
+				log.Printf("provider replay route conflict: trace=%s request_provider_id=%q request_provider=%q replay_provider=%q replay_model=%q rebind_from=%q attempts=%d probes=%d", _trace, _request.ProviderID, _request.Provider, _shared.provider, _shared.model, _shared.rebindFrom, _shared.attempts, _shared.probeAttempts)
 				if _headersSent && _request.Stream {
 					_h.writeGracefulStreamTerminal(_w, _budgetWriter, true, _refusalTerminal, _routeErr)
 				} else {
@@ -3510,6 +3520,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	_h.refreshConversationBindings()
 
 	_complexityRecorded := false
+	_recoveryProbeUsed := false
 	// 保活心跳送出後 header 就已經出去了，後續嘗試的 writer 必須承接這個狀態。
 	var _lastErr error
 	var _lastDeferred *deferredResponseWriter
@@ -3528,12 +3539,25 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	}
 
 	for _attempt := 0; _attempt <= _maxRetries; _attempt++ {
+		_budget.failed = _h.recoveryLimits.failedProviders(_turnRecoveryKey)
 		_target, _model, _profile, _selectionMeta, _err := _h.selectRetryProvider(&_request, &_budget)
+		var _finishModel func(bool, bool)
+		if _err == nil {
+			_modelKey := strings.ToLower(strings.TrimSpace(_target.Config.Kind)) + "\x00" + strings.TrimRight(_target.Config.BaseURL, "/") + "\x00" + _model.Name
+			_finishModel, _err = _h.recoveryLimits.acquireModel(_modelKey, _target.Config.ID)
+			if _err != nil {
+				_target.RequestRelease()()
+				log.Printf("provider model recovery gated: trace=%s provider=%q model=%q", _trace, _target.Config.ID, _model.Name)
+			} else {
+				defer _finishModel(false, false)
+			}
+		}
 		if _shared != nil {
 			_shared.round = _budget.round
 			_shared.usedProviders = append([]string(nil), _budget.used...)
 		}
 		_lastPolicy := proxy.ClassifyFailure(_lastErr)
+		_cooldownExhausted := false
 		if _err != nil && (_lastErr == nil || _lastPolicy.Capacity || _lastPolicy.RetryableServer) {
 			if _err != nil && _r.Context().Err() == nil {
 				_waitWriter := newDeferredResponseWriter(_w, _request.Stream)
@@ -3551,7 +3575,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 					_waitPhase, _spent = "admission", &_waitedForAdmission
 				}
 				_remaining := time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second - *_spent
-				_elapsed, _ready := waitForProviderCooldown(_r.Context(), _waitWriter, _waitHeartbeat, _err, _remaining)
+				_elapsed, _ready, _waitErr := waitForProviderCooldownResult(_r.Context(), _waitWriter, _waitHeartbeat, _err, _remaining)
 				*_spent += _elapsed
 				if _shared != nil {
 					_shared.waited, _shared.admissionWaited = _waitedForCooldown, _waitedForAdmission
@@ -3563,17 +3587,29 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 				} else if _headersSent {
 					_lastDeferred.AdoptCommitted()
 				}
-				if _r.Context().Err() != nil {
+				if _r.Context().Err() != nil || _waitErr != nil {
 					return
 				}
 				if _ready {
 					_attempt--
 					continue
 				}
+				var _unavailable *balancer.NoAvailableProviderError
+				if errors.As(_err, &_unavailable) && _unavailable.TemporaryOverload && _unavailable.RetryAfter > 0 {
+					_cooldownExhausted = true
+					_left := max(time.Nanosecond, _unavailable.RetryAfter-_elapsed)
+					_remainingErr := &balancer.NoAvailableProviderError{TemporaryOverload: true, RetryAfter: _left}
+					_seconds := balancer.SelectionRetryAfterSeconds(_remainingErr)
+					_err = fmt.Errorf("原候選來源仍在冷卻，約 %d 秒後再試；本次等待額度已用盡：%w", _seconds, _remainingErr)
+					_w.Header().Set("Retry-After", strconv.Itoa(_seconds))
+					if _shared != nil && _retrySettings.ProviderRetryWaitSeconds > 0 {
+						_shared.waitRetryAt = _shared.probeWindowAt.Add(reconnectRetryCooldown)
+					}
+				}
 			}
 		}
 		if _err != nil {
-			if !_request.Stream && _lastDeferred != nil && !_lastDeferred.Committed() && _lastDeferred.HasBufferedResponse() {
+			if !_cooldownExhausted && !_request.Stream && _lastDeferred != nil && !_lastDeferred.Committed() && _lastDeferred.HasBufferedResponse() {
 				_ = _lastDeferred.Commit()
 				return
 			}
@@ -3582,7 +3618,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 			// 先前只有「重試用盡」那條路做了這件事，選擇階段失敗卻直接回 503／502，
 			// 於是所有 provider 都不可用時每一輪都變成一次重連。
 			_terminalErr := _err
-			if _lastErr != nil {
+			if _lastErr != nil && !_cooldownExhausted {
 				_terminalErr = _lastErr
 			}
 			_terminalWriter := _lastDeferred
@@ -3595,7 +3631,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 				}
 				return
 			}
-			if _lastErr != nil {
+			if _lastErr != nil && !_cooldownExhausted {
 				_h.writeJSON(_w, http.StatusBadGateway, domain.ErrorResponse("provider_error", _lastErr.Error()))
 				return
 			}
@@ -3607,6 +3643,40 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_releaseSlot := _target.RequestRelease()
 		defer _releaseSlot()
 
+		// 先完成持久化配對，再更新重連來源與嘗試次數；保存失敗不能留下假派送。
+		if _r.Context().Err() != nil {
+			return
+		}
+		_switching := _shared != nil && _shared.rebindFrom != "" && _shared.rebindFrom != _target.Config.ID
+		_recovering := _shared != nil && (_shared.attempts > 0 || _shared.probeAttempts > 0 || _shared.rebindFrom != "")
+		if _limitErr := _h.recoveryLimits.checkTurn(_turnRecoveryKey, _switching, _recovering); _limitErr != nil {
+			_releaseSlot()
+			_finishModel(false, false)
+			log.Printf("provider turn recovery exhausted: trace=%s provider=%q switching=%t", _trace, _target.Config.ID, _switching)
+			if _request.Stream {
+				_terminal := newDeferredResponseWriter(_w, true)
+				if _headersSent {
+					_terminal.AdoptCommitted()
+				}
+				_h.writeGracefulStreamTerminal(_w, _terminal, true, _refusalTerminal, _limitErr)
+			} else {
+				_h.writeJSON(_w, http.StatusTooManyRequests, domain.ErrorResponse("turn_recovery_exhausted", _limitErr.Error()))
+			}
+			return
+		}
+		if _prepare != nil {
+			if _prepareErr := _prepare(_target, _model); _prepareErr != nil {
+				_releaseSlot()
+				log.Printf("provider dispatch preparation failed: trace=%s provider=%q model=%q error=%v", _trace, _target.Config.ID, _model.Name, _prepareErr)
+				if _request.Stream && _headersSent {
+					_h.writeGracefulStreamTerminal(_w, _budgetWriter, true, _refusalTerminal, _prepareErr)
+				} else {
+					_h.writeJSON(_w, http.StatusServiceUnavailable, domain.ErrorResponse("turn_binding_unavailable", _prepareErr.Error()))
+				}
+				return
+			}
+		}
+
 		if !_complexityRecorded {
 			// 只在第一次成功選擇時記錄：重試是同一個請求，不該重複計數。
 			noteKeyRequestComplexity(_r, _profile, _signals)
@@ -3617,8 +3687,12 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_request.ProviderID = _target.Config.ID
 		_request.Provider = _target.Config.ID
 		_request.Model = _model.Name
+		_h.recoveryLimits.recordTurn(_turnRecoveryKey, _target.Config.ID, false, _switching, _recovering)
 		_hasDispatched = true
 		if _shared != nil {
+			if resetReboundProviderAttempts(_shared, _target.Config.ID) {
+				log.Printf("provider work budget reset: trace=%s from=%q to=%q probes=%d limit=%d", _trace, _shared.rebindFrom, _target.Config.ID, _shared.probeAttempts, _shared.limit)
+			}
 			_shared.provider, _shared.model = _target.Config.ID, _model.Name
 			_shared.rebindFrom = ""
 			_shared.usedProviders = append(append([]string(nil), _budget.used...), _target.Config.ID)
@@ -3673,6 +3747,7 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 				}
 			} else {
 				_success = true
+				_finishModel(true, false)
 				if _metrics.FirstResponseMS > 0 {
 					_metrics.FirstResponseMS += float64(_attemptStarted.Sub(_started).Milliseconds())
 				}
@@ -3696,6 +3771,11 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		_lastErr = _forwardErr
 		_lastDeferred = _deferred
 		_failurePolicy := proxy.ClassifyFailure(_forwardErr)
+		_modelFailed := !_failurePolicy.Quota && (_failurePolicy.Capacity || _failurePolicy.RetryableServer)
+		_finishModel(false, _modelFailed)
+		if _modelFailed {
+			_h.recoveryLimits.recordTurn(_turnRecoveryKey, _target.Config.ID, true, false, false)
+		}
 		// 未向下游送出內容的容量拒絕，退回代理跨重連額度；每輪上限與來源冷卻不變。
 		// 這不是上游用量退款，也不能證明上游沒有執行工作。
 		if _shared != nil && _failurePolicy.Capacity && !_deferred.ContentWritten() && _shared.attempts > 0 {
@@ -3710,6 +3790,37 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 				_shared.rebindFrom = _target.Config.ID
 			}
 			log.Printf("provider capacity rebind prepared: trace=%s from=%s attempts_preserved=true", _trace, _target.Config.ID)
+		}
+		_recoveryRemaining := time.Duration(_retrySettings.ProviderRetryWaitSeconds)*time.Second - _waitedForCooldown
+		if _attempt >= _maxRetries && _failurePolicy.RetryableServer && providerFailureCanRetryBeforeFirstToken(_forwardErr, _deferred) && canContinueRecoveryProbe(_shared, _deferred, _recoveryProbeUsed, _recoveryRemaining) && _h.recoveryLimits.checkTurn(_turnRecoveryKey, false, true) == nil {
+			_recoveryProbeUsed = true
+			_recoveryWriter := newDeferredResponseWriter(_w, _request.Stream)
+			if _headersSent {
+				_recoveryWriter.AdoptCommitted()
+			}
+			_recoveryHeartbeat := _heartbeat
+			if !_request.Stream {
+				_recoveryHeartbeat = nil
+			}
+			_next, _elapsed, _recoveryErr := _h.continueRecoveryProbe(_r.Context(), _reconnectKey, _shared, _recoveryWriter, _recoveryHeartbeat, _recoveryRemaining, _trace)
+			_shared = _next
+			_waitedForCooldown += _elapsed
+			_headersSent = _headersSent || _recoveryWriter.Committed()
+			if _headersSent {
+				_deferred.AdoptCommitted()
+			}
+			if _shared != nil {
+				// 追蹤器恢復資格會重設等待紀錄；本連線已花的等待仍須累計。
+				_shared.waited = _waitedForCooldown
+			}
+			log.Printf("provider same-connection recovery: trace=%s elapsed=%s admitted=%t retry_waited=%s", _trace, _elapsed, _shared != nil, _waitedForCooldown)
+			if _recoveryErr != nil || _r.Context().Err() != nil {
+				return
+			}
+			if _shared != nil {
+				_maxRetries = _attempt + 1
+				continue
+			}
 		}
 		if _deferred.ContentWritten() || _attempt >= _maxRetries || !providerFailureCanRetryBeforeFirstToken(_forwardErr, _deferred) {
 			_reason := "not_retryable"

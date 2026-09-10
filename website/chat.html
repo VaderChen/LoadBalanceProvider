@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>測試對話 · LoadBalanceProvider</title>
+  <link rel="stylesheet" href="chat.css">
+  <script defer src="vendor/marked.js"></script>
+  <script defer src="vendor/purify.min.js"></script>
+  <script defer src="vendor/lucide.min.js"></script>
+  <script type="module" src="chat.js?v=sse-content-2"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>測試對話</h1>
+      <div class="controls">
+        <label>Provider<select id="provider" disabled><option value="">載入中…</option></select></label>
+        <label>模型<select id="model" disabled><option value="">尚未選擇</option></select></label>
+        <button id="refresh" class="icon" type="button" title="重新載入來源" aria-label="重新載入來源"><i data-lucide="refresh-cw"></i></button>
+        <button id="clear" class="icon" type="button" title="清空對話" aria-label="清空對話"><i data-lucide="trash-2"></i></button>
+      </div>
+    </header>
+    <div id="notice" role="alert" hidden></div>
+    <section id="messages" aria-label="對話紀錄" tabindex="0">
+      <div id="empty"><i data-lucide="messages-square"></i><h2>開始對話</h2></div>
+    </section>
+    <form id="composer">
+      <div class="composer-status">
+        <span id="activity" class="activity" aria-hidden="true" hidden><span></span><span></span><span></span></span>
+        <span id="status" role="status" aria-live="polite">載入來源中</span>
+      </div>
+      <div class="composer-input">
+        <textarea id="prompt" rows="3" maxlength="100000" placeholder="輸入訊息…" aria-label="訊息" required></textarea>
+        <div class="composer-actions">
+          <button id="stop" class="icon" type="button" hidden title="停止生成" aria-label="停止生成"><i data-lucide="square"></i></button>
+          <button id="send" class="icon primary" type="submit" disabled title="送出訊息" aria-label="送出訊息"><i data-lucide="arrow-up"></i></button>
+        </div>
+      </div>
+    </form>
+  </main>
+</body>
+</html>
