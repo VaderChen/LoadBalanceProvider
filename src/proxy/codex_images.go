@@ -18,23 +18,24 @@ import (
 )
 
 const (
-	defaultCodexImageMainModel = "gpt-5.4-mini"
 	defaultCodexImageToolModel = "gpt-image-2"
 	maxCodexImageResponseSize  = 128 * 1024 * 1024
 )
 
 // -------------------------------------------------------------------------------------
 type openAIImageGenerationRequest struct {
-	Prompt            string `json:"prompt"`
-	Model             string `json:"model,omitempty"`
-	N                 int    `json:"n,omitempty"`
-	Size              string `json:"size,omitempty"`
-	Quality           string `json:"quality,omitempty"`
-	Background        string `json:"background,omitempty"`
-	OutputFormat      string `json:"output_format,omitempty"`
-	OutputCompression *int   `json:"output_compression,omitempty"`
-	Moderation        string `json:"moderation,omitempty"`
-	ResponseFormat    string `json:"response_format,omitempty"`
+	InputImages       []map[string]interface{} `json:"-"`
+	Mask              map[string]interface{}   `json:"-"`
+	Prompt            string                   `json:"prompt"`
+	Model             string                   `json:"model,omitempty"`
+	N                 int                      `json:"n,omitempty"`
+	Size              string                   `json:"size,omitempty"`
+	Quality           string                   `json:"quality,omitempty"`
+	Background        string                   `json:"background,omitempty"`
+	OutputFormat      string                   `json:"output_format,omitempty"`
+	OutputCompression *int                     `json:"output_compression,omitempty"`
+	Moderation        string                   `json:"moderation,omitempty"`
+	ResponseFormat    string                   `json:"response_format,omitempty"`
 }
 
 // -------------------------------------------------------------------------------------
@@ -49,6 +50,12 @@ type codexImageResult struct {
 }
 
 // -------------------------------------------------------------------------------------
+// 圖片雖以 JSON 交付，下游等待期間仍由上游 SSE 活動計時管理。
+func UsesCodexImageStream(provider *balancer.ProviderRuntime, request *http.Request) bool {
+	return isOpenAICodexProvider(provider) && (isOpenAIImageGenerationRoute(request) || isOpenAIImageEditRoute(request))
+}
+
+// -------------------------------------------------------------------------------------
 func isOpenAIImageGenerationRoute(_request *http.Request) bool {
 	if _request == nil || _request.URL == nil {
 		return false
@@ -59,16 +66,25 @@ func isOpenAIImageGenerationRoute(_request *http.Request) bool {
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) forwardOpenAICodexImageGeneration(_ctx context.Context, _w http.ResponseWriter, _srcReq *http.Request, _provider *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _rawBody []byte, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) error {
-	_imageRequest, _err := decodeOpenAIImageGenerationRequest(_rawBody)
+	var _imageRequest openAIImageGenerationRequest
+	var _err error
+	if isOpenAIImageEditRoute(_srcReq) {
+		_imageRequest, _err = decodeCodexImageEdit(_rawBody, _srcReq.Header.Get("Content-Type"))
+	} else {
+		_imageRequest, _err = decodeOpenAIImageGenerationRequest(_rawBody)
+	}
 	if _err != nil {
-		return _err
+		return &ProviderStatusError{StatusCode: http.StatusBadRequest, Message: _err.Error(), FailureDetails: FailureDetails{Code: "invalid_request_error"}}
 	}
 
 	_authToken, _accountID, _useAPIKey, _err := codexImageAuthorization(_provider)
 	if _err != nil {
 		return _err
 	}
-	_mainModel := codexImageMainModel(_provider, _model, _useAPIKey)
+	_mainModel := codexImageMainModel(_provider)
+	if _mainModel == "" {
+		return &ProviderStatusError{StatusCode: http.StatusBadRequest, Message: "Provider 預設模型必須是有效的 Responses 主模型，不可為 AUTO 或圖片專用模型", FailureDetails: FailureDetails{Code: "invalid_request_error"}}
+	}
 	_targetURL := codexResponsesURL(*_provider.Config, _useAPIKey)
 	if _err := security.ValidateOutboundURL(_targetURL); _err != nil {
 		return _err
@@ -114,7 +130,9 @@ func decodeOpenAIImageGenerationRequest(_rawBody []byte) (openAIImageGenerationR
 	if _request.N > 10 {
 		return _request, fmt.Errorf("invalid image generation request: n must not exceed 10")
 	}
-	_request.Model = normalizeCodexImageToolModel(_request.Model)
+	if _err := normalizeCodexImageParameters(&_request); _err != nil {
+		return _request, _err
+	}
 	_request.ResponseFormat = strings.ToLower(strings.TrimSpace(_request.ResponseFormat))
 	if _request.ResponseFormat == "" {
 		_request.ResponseFormat = "b64_json"
@@ -160,25 +178,15 @@ func codexImageAuthorization(_provider *balancer.ProviderRuntime) (string, strin
 }
 
 // -------------------------------------------------------------------------------------
-func codexImageMainModel(_provider *balancer.ProviderRuntime, _selected *domain.LLMModelConfig, _useAPIKey bool) string {
-	// ChatGPT Codex OAuth 的 hosted image tool 目前以此 Responses 主模型為相容基準；
-	// OpenAI API Key 路徑則可尊重 Provider 已選定的 Responses 模型。
-	if !_useAPIKey {
-		return defaultCodexImageMainModel
+func codexImageMainModel(_provider *balancer.ProviderRuntime) string {
+	if _provider == nil || _provider.Config == nil || len(_provider.Config.Models) == 0 {
+		return ""
 	}
-	if _selected != nil && !isCodexImageOnlyModel(_selected.Name) {
-		if _name := codexUpstreamModelName(_selected.Name); _name != "" && _name != "auto" {
-			return _name
-		}
+	_name := codexUpstreamModelName(_provider.Config.Models[0].Name)
+	if strings.EqualFold(_name, "auto") || isCodexImageOnlyModel(_name) {
+		return ""
 	}
-	if _provider != nil && _provider.Config != nil {
-		for _, _candidate := range _provider.Config.Models {
-			if _name := codexUpstreamModelName(_candidate.Name); _name != "" && _name != "auto" && !isCodexImageOnlyModel(_name) {
-				return _name
-			}
-		}
-	}
-	return defaultCodexImageMainModel
+	return _name
 }
 
 // -------------------------------------------------------------------------------------
@@ -192,6 +200,16 @@ func buildCodexImageResponsesRequest(_mainModel string, _request openAIImageGene
 		"type":   "image_generation",
 		"action": "generate",
 		"model":  _request.Model,
+	}
+	content := []interface{}{map[string]interface{}{"type": "input_text", "text": _request.Prompt}}
+	if len(_request.InputImages) > 0 {
+		_tool["action"] = "edit"
+		for _, image := range _request.InputImages {
+			content = append(content, image)
+		}
+		if _request.Mask != nil {
+			_tool["input_image_mask"] = _request.Mask
+		}
 	}
 	for _name, _value := range map[string]string{
 		"size":          _request.Size,
@@ -211,7 +229,7 @@ func buildCodexImageResponsesRequest(_mainModel string, _request openAIImageGene
 	_payload := map[string]interface{}{
 		"model":               codexUpstreamModelName(_mainModel),
 		"instructions":        "",
-		"input":               []interface{}{map[string]interface{}{"type": "message", "role": "user", "content": []interface{}{map[string]interface{}{"type": "input_text", "text": _request.Prompt}}}},
+		"input":               []interface{}{map[string]interface{}{"type": "message", "role": "user", "content": content}},
 		"tools":               []interface{}{_tool},
 		"tool_choice":         map[string]interface{}{"type": "image_generation"},
 		"parallel_tool_calls": true,
@@ -248,7 +266,7 @@ func (_c *Client) requestCodexGeneratedImage(_ctx context.Context, _srcReq *http
 	if err := _provider.Config.CheckScheduledDowntime(); err != nil {
 		return codexImageResult{}, 0, err
 	}
-	_response, _err := dispatchProviderHTTP(_client, _request, _provider.Config)
+	_response, _err := doProviderHTTPRequest(_client, _request, providerStreamIdleTimeout(_provider), _provider.Config)
 	if _err != nil {
 		return codexImageResult{}, 0, _err
 	}
@@ -256,9 +274,14 @@ func (_c *Client) requestCodexGeneratedImage(_ctx context.Context, _srcReq *http
 	_provider.RecordUsageHeaders(_response.Header)
 	if _response.StatusCode < http.StatusOK || _response.StatusCode >= http.StatusMultipleChoices {
 		_raw, _ := io.ReadAll(io.LimitReader(_response.Body, 1024*1024))
-		return codexImageResult{}, 0, fmt.Errorf("openai codex image generation failed: status %d: %s", _response.StatusCode, strings.TrimSpace(string(_raw)))
+		status := &ProviderStatusError{StatusCode: _response.StatusCode, Message: strings.TrimSpace(string(_raw)), FailureDetails: FailureDetails{RetryAfter: retryAfterHeader(_response.Header)}}
+		EnrichFailure(status, string(_raw))
+		return codexImageResult{}, 0, status
 	}
-	return readCodexGeneratedImage(_response.Body)
+	idle := newStreamIdleTimeoutReader(_response.Body, providerStreamIdleTimeout(_provider))
+	defer idle.Stop()
+	result, created, err := readCodexGeneratedImage(idle)
+	return result, created, retainStreamRetryAfter(err, _response.Header)
 }
 
 // -------------------------------------------------------------------------------------
@@ -269,7 +292,9 @@ func readCodexGeneratedImage(_reader io.Reader) (codexImageResult, int64, error)
 	var _event strings.Builder
 
 	_consume := func() (bool, error) {
-		_eventName, _payloadText := codexSSEEventNameAndPayload(_event.String())
+		rawEvent := _event.String()
+		markStreamActivity(_reader, rawEvent)
+		_eventName, _payloadText := codexSSEEventNameAndPayload(rawEvent)
 		_event.Reset()
 		if _payloadText == "" || _payloadText == "[DONE]" {
 			return false, nil
@@ -307,7 +332,7 @@ func readCodexGeneratedImage(_reader io.Reader) (codexImageResult, int64, error)
 			if _message == "" {
 				_message = "upstream image generation failed"
 			}
-			return true, fmt.Errorf("openai codex image generation failed: %s", _message)
+			return true, &ProviderStreamError{Message: _message, FailureDetails: failureDetailsFromEvent(rawEvent)}
 		}
 		return false, nil
 	}
@@ -339,10 +364,7 @@ func readCodexGeneratedImage(_reader io.Reader) (codexImageResult, int64, error)
 					return _pending, _createdAt, nil
 				}
 			}
-			if strings.TrimSpace(_pending.Base64) != "" {
-				return _pending, _createdAt, nil
-			}
-			return codexImageResult{}, _createdAt, fmt.Errorf("openai codex image stream ended before an image was returned")
+			return codexImageResult{}, _createdAt, &ProviderStreamError{Message: "openai codex image stream ended before response.completed", TruncatedStream: true}
 		}
 	}
 }

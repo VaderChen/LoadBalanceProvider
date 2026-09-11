@@ -43,6 +43,9 @@ type AdvancedSettingsConfig struct {
 	ProviderRetrySourcesPerRound             int     `json:"provider_retry_sources_per_round"`
 	ProviderRetryWaitSeconds                 int     `json:"provider_retry_wait_seconds"`
 	PersistQuotaCooldown                     bool    `json:"persist_quota_cooldown"`
+	GlobalDispatchRateEnabled                bool    `json:"global_dispatch_rate_enabled"`
+	GlobalConcurrencyEnabled                 bool    `json:"global_concurrency_enabled"`
+	CooldownSingleProbeEnabled               bool    `json:"cooldown_single_probe_enabled"`
 	ConversationAffinityTTLMinutes           int     `json:"conversation_affinity_ttl_minutes"`
 	ConversationAffinityQuotaTolerancePoints float64 `json:"conversation_affinity_quota_tolerance_points"`
 	ResponseRouteMaxEntries                  int     `json:"response_route_max_entries"`

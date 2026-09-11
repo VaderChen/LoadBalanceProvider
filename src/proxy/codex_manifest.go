@@ -83,6 +83,8 @@ func AddAutoModelToCodexManifest(_body []byte) ([]byte, error) {
 	_hasPriority := false
 	_customIndex := -1
 	for _idx, _model := range _models {
+		// 本代理目前只提供 HTTP/SSE，不宣告可用的 WebSocket 傳輸。
+		_model["prefer_websockets"] = json.RawMessage("false")
 		_isAuto := strings.EqualFold(manifestRawString(_model["slug"]), "AUTO")
 		if _isAuto {
 			_customIndex = _idx
@@ -114,6 +116,7 @@ func AddAutoModelToCodexManifest(_body []byte) ([]byte, error) {
 	_custom := _models[_customIndex]
 	for _key, _value := range map[string]interface{}{
 		"slug":                    "AUTO",
+		"prefer_websockets":       false,
 		"display_name":            "AUTO",
 		"description":             "由 Mars LLM Proxy 自動選擇 Provider 與預設模型。",
 		"visibility":              "list",

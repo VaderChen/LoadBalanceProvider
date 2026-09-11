@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"LoadBalanceProvider/src/balancer"
 	"LoadBalanceProvider/src/domain"
 )
 
@@ -40,12 +41,10 @@ func TestBuildCodexImageResponsesRequestSeparatesMainAndImageModels(t *testing.T
 }
 
 // -------------------------------------------------------------------------------------
-func TestCodexImageOAuthUsesCompatibleMainModel(t *testing.T) {
-	if _model := codexImageMainModel(nil, &domain.LLMModelConfig{Name: "gpt-5.6-sol"}, false); _model != defaultCodexImageMainModel {
-		t.Fatalf("unexpected OAuth image main model: %s", _model)
-	}
-	if _model := codexImageMainModel(nil, &domain.LLMModelConfig{Name: "gpt-5.6-sol"}, true); _model != "gpt-5.6-sol" {
-		t.Fatalf("API key image model should respect selection: %s", _model)
+func TestCodexImageUsesConfiguredMainModel(t *testing.T) {
+	_provider := &balancer.ProviderRuntime{Config: &domain.LLMProviderConfig{Models: []domain.LLMModelConfig{{Name: "gpt-5.6-sol"}}}}
+	if _model := codexImageMainModel(_provider); _model != "gpt-5.6-sol" {
+		t.Fatalf("image main model should respect provider default: %s", _model)
 	}
 }
 

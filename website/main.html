@@ -6,7 +6,7 @@
   <title>LLM Proxy 儀表版</title>
   <script src="i18n.js"></script>
   <script defer src="vendor/lucide.min.js" onload="lucide.createIcons()"></script>
-  <script defer src="settings-tooltips.js"></script>
+  <script defer src="settings-tooltips.js?v=traffic-protection-1"></script>
   <style>
     .parameter-help {
       width: fit-content;
@@ -831,6 +831,23 @@
       margin-top: 18px;
     }
 
+    .settings-parameter-grid.traffic-protection-grid {
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+    }
+
+    .traffic-protection-grid > .field {
+      display: flex;
+      align-items: center;
+      flex-wrap: nowrap;
+      gap: 12px;
+    }
+
+    .traffic-protection-grid > .field > span {
+      flex: 0 0 130px;
+      width: 130px;
+      white-space: nowrap;
+    }
+
     .settings-parameter-note {
       margin: 14px 0 0;
       color: var(--muted);
@@ -1030,6 +1047,11 @@
     .toggle-switch input:disabled + span {
       cursor: wait;
       opacity: .62;
+    }
+
+    .toggle-switch input:focus-visible + span {
+      outline: 2px solid #216c52;
+      outline-offset: 3px;
     }
 
     .settings-actions {
@@ -2163,10 +2185,6 @@
                       <input class="text-input" id="providerRetryWaitSeconds" type="number" min="0" max="300" step="1" inputmode="numeric">
                     </label>
                     <label class="field">
-                      <span>保存長時間配額冷卻</span>
-                      <input id="persistQuotaCooldown" type="checkbox">
-                    </label>
-                    <label class="field">
                       <span>每 Provider 綁定上限</span>
                       <input class="text-input" id="maxBindingsPerProvider" type="number" min="1" max="1000" step="1" inputmode="numeric">
                     </label>
@@ -2174,6 +2192,45 @@
                   <div class="settings-actions">
                     <button class="soft-button" type="button" id="reloadAdvancedButton">重新載入</button>
                     <button class="primary-button" type="button" id="saveAdvancedButton">儲存參數</button>
+                  </div>
+                </div>
+              </section>
+              <section class="settings-card">
+                <div class="settings-card-title">全站流量保護</div>
+                <div class="settings-card-body">
+                  <div class="settings-parameter-grid traffic-protection-grid">
+                    <div class="field">
+                      <span id="globalDispatchRateEnabledLabel">全站發送速率</span>
+                      <label class="toggle-switch">
+                        <input id="globalDispatchRateEnabled" type="checkbox" role="switch" aria-labelledby="globalDispatchRateEnabledLabel">
+                        <span aria-hidden="true"></span>
+                      </label>
+                    </div>
+                    <div class="field">
+                      <span id="globalConcurrencyEnabledLabel">全站併發</span>
+                      <label class="toggle-switch">
+                        <input id="globalConcurrencyEnabled" type="checkbox" role="switch" aria-labelledby="globalConcurrencyEnabledLabel">
+                        <span aria-hidden="true"></span>
+                      </label>
+                    </div>
+                    <div class="field">
+                      <span id="cooldownSingleProbeEnabledLabel">冷卻單筆探測</span>
+                      <label class="toggle-switch">
+                        <input id="cooldownSingleProbeEnabled" type="checkbox" role="switch" aria-labelledby="cooldownSingleProbeEnabledLabel">
+                        <span aria-hidden="true"></span>
+                      </label>
+                    </div>
+                    <div class="field">
+                      <span id="persistQuotaCooldownLabel">保存長時間配額冷卻</span>
+                      <label class="toggle-switch">
+                        <input id="persistQuotaCooldown" type="checkbox" role="switch" aria-labelledby="persistQuotaCooldownLabel">
+                        <span aria-hidden="true"></span>
+                      </label>
+                    </div>
+                  </div>
+                  <div class="settings-actions">
+                    <button class="soft-button" type="button" id="reloadProtectionButton">重新載入</button>
+                    <button class="primary-button" type="button" id="saveProtectionButton">儲存參數</button>
                   </div>
                 </div>
               </section>
@@ -2686,6 +2743,10 @@
       providerRetrySourcesPerRound: document.getElementById("providerRetrySourcesPerRound"),
       providerRetryWaitSeconds: document.getElementById("providerRetryWaitSeconds"),
       persistQuotaCooldown: document.getElementById("persistQuotaCooldown"),
+      globalDispatchRateEnabled: document.getElementById("globalDispatchRateEnabled"),
+      globalConcurrencyEnabled: document.getElementById("globalConcurrencyEnabled"),
+      cooldownSingleProbeEnabled: document.getElementById("cooldownSingleProbeEnabled"),
+      saveProtectionButton: document.getElementById("saveProtectionButton"),
       maxBindingsPerProvider: document.getElementById("maxBindingsPerProvider"),
       yieldLowMaxPercent: document.getElementById("yieldLowMaxPercent"),
       yieldMidMaxPercent: document.getElementById("yieldMidMaxPercent"),
@@ -4037,6 +4098,9 @@
       els.providerRetrySourcesPerRound.value = advanced.providerRetrySourcesPerRound ?? 0;
       els.providerRetryWaitSeconds.value = advanced.providerRetryWaitSeconds ?? 30;
       els.persistQuotaCooldown.checked = advanced.persistQuotaCooldown ?? true;
+      els.globalDispatchRateEnabled.checked = advanced.globalDispatchRateEnabled ?? false;
+      els.globalConcurrencyEnabled.checked = advanced.globalConcurrencyEnabled ?? false;
+      els.cooldownSingleProbeEnabled.checked = advanced.cooldownSingleProbeEnabled ?? false;
       els.maxBindingsPerProvider.value = advanced.maxBindingsPerProvider ?? 8;
       els.yieldLowMaxPercent.value = advanced.yieldLowMaxPercent ?? 2;
       els.yieldMidMaxPercent.value = advanced.yieldMidMaxPercent ?? 20;
@@ -4059,6 +4123,9 @@
         providerRetrySourcesPerRound: Number(els.providerRetrySourcesPerRound.value),
         providerRetryWaitSeconds: Number(els.providerRetryWaitSeconds.value),
         persistQuotaCooldown: els.persistQuotaCooldown.checked,
+        globalDispatchRateEnabled: els.globalDispatchRateEnabled.checked,
+        globalConcurrencyEnabled: els.globalConcurrencyEnabled.checked,
+        cooldownSingleProbeEnabled: els.cooldownSingleProbeEnabled.checked,
         maxBindingsPerProvider: Number(els.maxBindingsPerProvider.value)
       };
       if (!Number.isInteger(settings.conversationAffinityTTLMinutes) || settings.conversationAffinityTTLMinutes < 1 || settings.conversationAffinityTTLMinutes > 10080) {
@@ -4097,6 +4164,7 @@
       }
 
       els.saveAdvancedButton.disabled = true;
+      els.saveProtectionButton.disabled = true;
       els.advancedStatusMessage.textContent = "進階設定儲存中。";
       try {
         const payload = await apiRequest("api/settings/advanced", {
@@ -4114,6 +4182,7 @@
         els.advancedStatusMessage.textContent = err.message || "儲存進階設定失敗。";
       } finally {
         els.saveAdvancedButton.disabled = false;
+        els.saveProtectionButton.disabled = false;
       }
     }
 
@@ -5170,6 +5239,8 @@
       void withLoadingDialog(loadAdvancedSettings, "正在重新載入進階設定...");
     });
     els.saveAdvancedButton.addEventListener("click", saveAdvancedSettings);
+    els.saveProtectionButton.addEventListener("click", saveAdvancedSettings);
+    document.getElementById("reloadProtectionButton").addEventListener("click", () => els.reloadAdvancedButton.click());
     els.reloadYieldThresholdsButton.addEventListener("click", () => {
       void withLoadingDialog(loadAdvancedSettings, "正在重新載入輸出比分級門檻...");
     });

@@ -81,6 +81,7 @@ func (h *HTTPAPI) applyTurnBinding(req *domain.ChatCompletionRequest, body []byt
 		return "", turnError("本回合已固定 Provider，不能中途變更路由")
 	}
 	req.ProviderID, req.Provider, req.Model = target.ProviderID, target.ProviderID, target.Model
+	*r = *r.WithContext(proxy.WithVerifiedTurnStateProvider(r.Context(), target.ProviderID))
 	return key, nil
 }
 

@@ -257,6 +257,7 @@ func (_c *Client) forwardOpenAICodexResponsesRoute(_ctx context.Context, _w http
 		req.Header.Set("Accept", _accept)
 	}
 	applyCodexUpstreamHeaders(_srcReq, req, true)
+	copyVerifiedCodexTurnState(_srcReq, req, _provider.Config.ID)
 	if _accountID != "" {
 		req.Header.Set("chatgpt-account-id", _accountID)
 	}

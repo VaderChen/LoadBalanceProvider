@@ -340,7 +340,7 @@ func (_c *Client) ForwardChatCompletion(_ctx context.Context, _w http.ResponseWr
 
 // -------------------------------------------------------------------------------------
 func (_c *Client) ForwardMultimodal(_ctx context.Context, _w http.ResponseWriter, _srcReq *http.Request, _provider *balancer.ProviderRuntime, _model *domain.LLMModelConfig, _targetURL string, _rawBody []byte, _stream bool, _profile domain.RequestProfile, _selectionMeta balancer.SelectionMeta) error {
-	if isOpenAICodexProvider(_provider) && isOpenAIImageGenerationRoute(_srcReq) {
+	if UsesCodexImageStream(_provider, _srcReq) {
 		return _c.forwardOpenAICodexImageGeneration(_ctx, _w, _srcReq, _provider, _model, _rawBody, _profile, _selectionMeta)
 	}
 
@@ -365,14 +365,27 @@ func (_c *Client) ForwardMultimodal(_ctx context.Context, _w http.ResponseWriter
 		}
 	}
 
+	var _errorBody providerErrorBodyCapture
+	var _responseReader io.Reader = _resp.Body
+	if _resp.StatusCode < http.StatusOK || _resp.StatusCode >= http.StatusMultipleChoices {
+		_responseReader = io.TeeReader(_resp.Body, &_errorBody)
+	}
 	var _copyErr error
 	if _stream {
-		_, _copyErr = copyAndFlush(_w, _resp.Body)
+		_, _copyErr = copyAndFlush(_w, _responseReader)
 	} else {
-		_, _copyErr = io.Copy(_w, _resp.Body)
+		_, _copyErr = io.Copy(_w, _responseReader)
 	}
 	if _resp.StatusCode < http.StatusOK || _resp.StatusCode >= http.StatusMultipleChoices {
-		return &ProviderStatusError{FailureDetails: FailureDetails{RetryAfter: retryAfterHeader(_resp.Header)}, StatusCode: _resp.StatusCode, ResponseForwarded: true}
+		status := &ProviderStatusError{FailureDetails: FailureDetails{RetryAfter: retryAfterHeader(_resp.Header)}, StatusCode: _resp.StatusCode, ResponseForwarded: true, Message: strings.TrimSpace(string(_errorBody.body))}
+		EnrichFailure(status, string(_errorBody.body))
+		if status.Message == "" {
+			status.Message = "upstream returned an empty error body"
+			if _copyErr != nil {
+				status.Message = fmt.Sprintf("unable to read or forward upstream error body: %v", _copyErr)
+			}
+		}
+		return status
 	}
 	return _copyErr
 }
@@ -530,6 +543,7 @@ func copyProviderPassthroughHeaders(_srcReq *http.Request, _targetReq *http.Requ
 		"OpenAI-Organization",
 		"OpenAI-Project",
 		"Idempotency-Key",
+		"X-Codex-Imagegen-Request-Id",
 		"Session_id",
 		"Conversation_id",
 		"Originator",

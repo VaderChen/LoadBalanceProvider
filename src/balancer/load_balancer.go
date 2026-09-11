@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"LoadBalanceProvider/src/providerdispatch"
 	"context"
 	"encoding/json"
 	"errors"
@@ -185,6 +186,7 @@ func NewLoadBalancer(_config *domain.ProxyConfig) *LoadBalancer {
 	}
 
 	config.ApplyDefaults(_config)
+	providerdispatch.ConfigureProviders(_config.Providers)
 
 	_providers := make([]*ProviderRuntime, 0, len(_config.Providers))
 	for _idx := range _config.Providers {
@@ -253,6 +255,7 @@ func (_b *LoadBalancer) ReloadConfig(_config *domain.ProxyConfig) {
 
 	_b.Config = _config
 	_b.Providers = _providers
+	providerdispatch.ConfigureProviders(_config.Providers)
 }
 
 // -------------------------------------------------------------------------------------
@@ -316,6 +319,30 @@ func (_b *LoadBalancer) selectExcluding(_req *domain.ChatCompletionRequest, _exc
 
 	_requestedModel, _modelFallbackReason := _b.effectiveRequestedModel(_req)
 	_candidates, _fallbackReason := _b.collectCandidates(_req, _profile, _requestedModel, _excluded)
+	if len(_candidates) == 0 {
+		// 明確綁定的模型可能承載續接狀態，不在這裡自行換模型。
+		if requestedModelIsExplicit(_requestedModel) && !requestPinsProvider(_req) {
+			selectionErr := _b.noAvailableProviderError(_req, _profile, _requestedModel, _excluded)
+			var unavailable *NoAvailableProviderError
+			if !errors.As(selectionErr, &unavailable) || !unavailable.TemporaryOverload {
+				fallback, reason := _b.collectCandidates(_req, _profile, "AUTO", _excluded)
+				if len(fallback) > 0 {
+					_candidates, _fallbackReason = fallback, reason
+					_modelFallbackReason = fmt.Sprintf("fallback: model %q unavailable; selected a compatible configured model", _requestedModel)
+					_requestedModel = "AUTO"
+				}
+			}
+		}
+		if len(_candidates) == 0 && !requestedModelIsExplicit(_requestedModel) {
+			fallbackProfile := autoFallbackProfile(_req, _profile)
+			_profile = fallbackProfile
+			fallback, reason := _b.collectCandidates(_req, fallbackProfile, _requestedModel, _excluded)
+			if len(fallback) > 0 {
+				_candidates, _fallbackReason, _profile = fallback, reason, fallbackProfile
+				_modelFallbackReason = "fallback: AUTO uses configured token limits instead of inferred long_context capability"
+			}
+		}
+	}
 
 	if len(_candidates) == 0 {
 		_selectionErr := _b.noAvailableProviderError(_req, _profile, _requestedModel, _excluded)
@@ -1107,6 +1134,7 @@ func (_p *ProviderRuntime) MarkSuccess(_latency time.Duration) {
 
 // -------------------------------------------------------------------------------------
 func (_p *ProviderRuntime) MarkSuccessWithMetrics(_latency time.Duration, _completionTokens int, _reactionMS float64, _tokenSpeed float64, _clientDeliveryTPS float64) {
+	providerdispatch.Success(_p.Config, time.Now().Add(-_latency))
 	_durationMS := float64(_latency) / float64(time.Millisecond)
 	_tokenSpeed = NormalizeTokenRate(int64(_completionTokens), _durationMS, _tokenSpeed)
 	_clientDeliveryTPS = NormalizeTokenRate(int64(_completionTokens), _durationMS, _clientDeliveryTPS)
@@ -1166,6 +1194,7 @@ func (_p *ProviderRuntime) MarkTemporaryUnavailable(_latency time.Duration, _dur
 	atomic.AddInt64(&_p.runtimeState().Failures, 1)
 	_p.recordLatency(_latency)
 	_until := time.Now().Add(_duration).UnixNano()
+	providerdispatch.Cooldown(_p.Config, time.Unix(0, _until))
 	for {
 		_previous := atomic.LoadInt64(&_p.runtimeState().CapacityUnavailableUntil)
 		if _previous >= _until || atomic.CompareAndSwapInt64(&_p.runtimeState().CapacityUnavailableUntil, _previous, _until) {

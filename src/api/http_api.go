@@ -61,6 +61,7 @@ const (
 
 // -------------------------------------------------------------------------------------
 type HTTPAPI struct {
+	providerWaiters        providerWaitQueue
 	recoveryLimits         recoveryLimits
 	reconnectBudgets       reconnectBudgetStore
 	activeResponseRequests sync.Map
@@ -166,6 +167,9 @@ type AdvancedSettingsForm struct {
 	ProviderRetrySourcesPerRound             int     `json:"providerRetrySourcesPerRound"`
 	ProviderRetryWaitSeconds                 int     `json:"providerRetryWaitSeconds"`
 	PersistQuotaCooldown                     bool    `json:"persistQuotaCooldown"`
+	GlobalDispatchRateEnabled                bool    `json:"globalDispatchRateEnabled"`
+	GlobalConcurrencyEnabled                 bool    `json:"globalConcurrencyEnabled"`
+	CooldownSingleProbeEnabled               bool    `json:"cooldownSingleProbeEnabled"`
 	ConversationAffinityTTLMinutes           int     `json:"conversationAffinityTTLMinutes"`
 	ConversationAffinityQuotaTolerancePoints float64 `json:"conversationAffinityQuotaTolerancePoints"`
 	ResponseRouteMaxEntries                  int     `json:"responseRouteMaxEntries"`
@@ -191,6 +195,9 @@ type AdvancedSettingsUpdateRequest struct {
 	ProviderRetrySourcesPerRound             *int     `json:"providerRetrySourcesPerRound"`
 	ProviderRetryWaitSeconds                 *int     `json:"providerRetryWaitSeconds"`
 	PersistQuotaCooldown                     *bool    `json:"persistQuotaCooldown"`
+	GlobalDispatchRateEnabled                *bool    `json:"globalDispatchRateEnabled"`
+	GlobalConcurrencyEnabled                 *bool    `json:"globalConcurrencyEnabled"`
+	CooldownSingleProbeEnabled               *bool    `json:"cooldownSingleProbeEnabled"`
 	ConversationAffinityTTLMinutes           *int     `json:"conversationAffinityTTLMinutes"`
 	ConversationAffinityQuotaTolerancePoints *float64 `json:"conversationAffinityQuotaTolerancePoints"`
 	ResponseRouteMaxEntries                  *int     `json:"responseRouteMaxEntries"`
@@ -1562,6 +1569,15 @@ func (_h *HTTPAPI) handleSaveAdvancedSettings(_w http.ResponseWriter, _body []by
 	if _request.PersistQuotaCooldown != nil {
 		_saved.PersistQuotaCooldown = *_request.PersistQuotaCooldown
 	}
+	if _request.GlobalDispatchRateEnabled != nil {
+		_saved.GlobalDispatchRateEnabled = *_request.GlobalDispatchRateEnabled
+	}
+	if _request.GlobalConcurrencyEnabled != nil {
+		_saved.GlobalConcurrencyEnabled = *_request.GlobalConcurrencyEnabled
+	}
+	if _request.CooldownSingleProbeEnabled != nil {
+		_saved.CooldownSingleProbeEnabled = *_request.CooldownSingleProbeEnabled
+	}
 	if _request.ConversationAffinityTTLMinutes != nil {
 		_saved.ConversationAffinityTTLMinutes = *_request.ConversationAffinityTTLMinutes
 	}
@@ -1798,6 +1814,7 @@ func (_h *HTTPAPI) cacheAdvancedSettings(_settings domain.AdvancedSettingsConfig
 	_h.advancedSettingsLock.Lock()
 	_h.advancedSettings = _settings
 	_h.advancedSettingsLoaded = true
+	proxy.ConfigureDispatchProtection(_settings)
 	_h.advancedSettingsLock.Unlock()
 	if _h.Client != nil {
 		_h.Client.ConfigureResponseRouteCache(
@@ -1821,6 +1838,9 @@ func advancedSettingsForm(_config domain.AdvancedSettingsConfig) AdvancedSetting
 		ProviderRetrySourcesPerRound:             _config.ProviderRetrySourcesPerRound,
 		ProviderRetryWaitSeconds:                 _config.ProviderRetryWaitSeconds,
 		PersistQuotaCooldown:                     _config.PersistQuotaCooldown,
+		GlobalDispatchRateEnabled:                _config.GlobalDispatchRateEnabled,
+		GlobalConcurrencyEnabled:                 _config.GlobalConcurrencyEnabled,
+		CooldownSingleProbeEnabled:               _config.CooldownSingleProbeEnabled,
 		ConversationAffinityTTLMinutes:           _config.ConversationAffinityTTLMinutes,
 		ConversationAffinityQuotaTolerancePoints: _config.ConversationAffinityQuotaTolerancePoints,
 		ResponseRouteMaxEntries:                  _config.ResponseRouteMaxEntries,
@@ -3119,6 +3139,7 @@ func (_h *HTTPAPI) handleResponsesProxy(_w http.ResponseWriter, _r *http.Request
 	if (_recoverMissing || _recovered) && _recoveryRoute != "" {
 		if _restored, _restoreErr := prepareRecoveryBody(_body, !_recovered); _restoreErr == nil {
 			_body, _turnRoute, _turnErr = _restored, _recoveryRoute, nil
+			_r = _r.WithContext(proxy.WithVerifiedTurnStateProvider(_r.Context(), ""))
 			_r = _r.WithContext(context.WithValue(_r.Context(), turnRecoveryContextKey{}, true))
 			if _recoverMissing {
 				log.Printf("turn binding recovery: full history preserved; account-specific reasoning discarded")
@@ -3147,6 +3168,7 @@ func (_h *HTTPAPI) handleResponsesProxy(_w http.ResponseWriter, _r *http.Request
 			return false
 		}
 		_body, _rebindFrom = restored, provider
+		_r = _r.WithContext(proxy.WithVerifiedTurnStateProvider(_r.Context(), ""))
 		_r = _r.WithContext(context.WithValue(_r.Context(), turnRecoveryContextKey{}, true))
 		return true
 	}
@@ -3546,6 +3568,12 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 	}
 
 	_nextDispatchAt := time.Time{}
+	var _releaseWaiter func()
+	defer func() {
+		if _releaseWaiter != nil {
+			_releaseWaiter()
+		}
+	}()
 	_ordinaryFailures := 0
 	if _shared != nil {
 		_nextDispatchAt = _shared.nextDispatchAt
@@ -3595,6 +3623,21 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 		}
 		_lastPolicy := proxy.ClassifyFailure(_lastErr)
 		_cooldownExhausted := false
+		var _waitingErr *balancer.NoAvailableProviderError
+		if _releaseWaiter == nil && errors.As(_err, &_waitingErr) && _waitingErr.TemporaryOverload && _retrySettings.ProviderRetryWaitSeconds > 0 {
+			var _queueErr error
+			_releaseWaiter, _queueErr = _h.providerWaiters.acquire(_request)
+			if _queueErr != nil {
+				log.Printf("provider wait rejected: trace=%s reason=queue_full", _trace)
+				if _headersSent && _request.Stream {
+					_h.writeGracefulStreamTerminal(_w, _budgetWriter, true, _refusalTerminal, _queueErr)
+				} else {
+					_w.Header().Set("Retry-After", "10")
+					_h.writeJSON(_w, http.StatusTooManyRequests, domain.ErrorResponse("provider_wait_queue_full", _queueErr.Error()))
+				}
+				return
+			}
+		}
 		if _err != nil && (_lastErr == nil || _lastPolicy.Capacity || _lastPolicy.RetryableServer) {
 			if _err != nil && _r.Context().Err() == nil {
 				_waitWriter := newDeferredResponseWriter(_w, _request.Stream)
@@ -3679,6 +3722,10 @@ func (_h *HTTPAPI) executeProviderRequest(_w http.ResponseWriter, _r *http.Reque
 
 		_releaseSlot := _target.RequestRelease()
 		defer _releaseSlot()
+		if _releaseWaiter != nil {
+			_releaseWaiter()
+			_releaseWaiter = nil
+		}
 
 		// 先完成持久化配對，再更新重連來源與嘗試次數；保存失敗不能留下假派送。
 		if _r.Context().Err() != nil {
@@ -4409,11 +4456,19 @@ func (_h *HTTPAPI) handleMultimodalProxy(_w http.ResponseWriter, _r *http.Reques
 		_timeout = time.Duration(domain.DefaultProviderTimeoutSeconds) * time.Second
 	}
 
-	_ctx, _cancel := requestForwardContext(_r.Context(), _timeout, _selectionReq.Stream)
+	_sourceRequest := _r.Clone(_r.Context())
+	_sourceRequest.URL.Path = _spec.Path
+	_sourceRequest.URL.RawPath = ""
+	_ctx, _cancel := requestForwardContext(_r.Context(), _timeout, _selectionReq.Stream || proxy.UsesCodexImageStream(_target, _sourceRequest))
 	defer _cancel()
 
-	_forwardErr := _h.Client.ForwardMultimodal(_ctx, _w, _r, _target, _model, providerEndpointURL(_target.Config, _spec.Path), _body, _selectionReq.Stream, _profile, _selectionMeta)
+	_forwardErr := _h.Client.ForwardMultimodal(_ctx, _w, _sourceRequest, _target, _model, providerEndpointURL(_target.Config, _spec.Path), _body, _selectionReq.Stream, _profile, _selectionMeta)
 	if _forwardErr != nil {
+		var _statusErr *proxy.ProviderStatusError
+		if errors.As(_forwardErr, &_statusErr) && _statusErr.StatusCode == http.StatusBadRequest && _statusErr.Code == "invalid_request_error" && !proxy.ResponseAlreadyForwarded(_forwardErr) {
+			_h.writeJSON(_w, http.StatusBadRequest, domain.ErrorResponse("invalid_request_error", _statusErr.Error()))
+			return
+		}
 		recordProviderForwardFailure(_target, _forwardErr, _r, time.Since(_started), _h.providerCapacityCooldown(), _h.providerServerErrorCooldown(), _model.Name)
 		if proxy.ClassifyFailure(_forwardErr).Quota {
 			_h.persistQuotaCooldown(_target)

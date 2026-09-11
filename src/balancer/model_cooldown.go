@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"LoadBalanceProvider/src/providerdispatch"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,7 @@ func (p *ProviderRuntime) QuotaCooldownUntil() time.Time {
 }
 
 func (p *ProviderRuntime) RestoreQuotaCooldown(until time.Time) {
+	providerdispatch.Cooldown(p.Config, until)
 	for {
 		old := atomic.LoadInt64(&p.runtimeState().QuotaUnavailableUntil)
 		if old >= until.UnixNano() || atomic.CompareAndSwapInt64(&p.runtimeState().QuotaUnavailableUntil, old, until.UnixNano()) {
@@ -54,6 +56,7 @@ func (p *ProviderRuntime) MarkModelUnavailable(model string, latency, duration t
 		duration = 30 * time.Second
 	}
 	now := time.Now()
+	providerdispatch.Cooldown(p.Config, now.Add(duration))
 	p.runtimeState().modelCooldownLock.Lock()
 	if p.runtimeState().modelCooldowns == nil {
 		p.runtimeState().modelCooldowns = make(map[string]time.Time)

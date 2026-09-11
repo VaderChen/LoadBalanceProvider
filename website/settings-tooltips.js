@@ -1,5 +1,8 @@
 (() => {
   const descriptions = {
+    globalDispatchRateEnabled: '開啟後，所有 Provider 推論請求合計每 5 秒最多發送一筆，不累積突發額度。重試與直連診斷也受限；關閉後仍保留每個來源原有的 10 秒間隔。僅限本服務程序，不跨部署共用。',
+    globalConcurrencyEnabled: '開啟後，全站上游推論併發上限為啟用且未處於停機時段的對話 Provider 帳號條目數 × 2，不計分類器及空端點；一般冷卻不改變計數。包含重試與直連診斷，沒有啟用來源時保留 2 條診斷額度。這是全站總額度，不強制每帳號各占 2 條；各來源自己的最大併發仍有效。上限降低不取消既有連線。',
+    cooldownSingleProbeEnabled: '開啟後，來源或模型冷卻會保守地限制整個 Provider；冷卻結束後只允許一條上游推論連線探測。正式代理確認成功才解除探測限制，失敗依既有冷卻策略處理；直連診斷不會解除限制。不改變對話綁定。',
     conversationAffinityTTLMinutes: '保留對話與來源配對的時間。調長可延長配對保留；是否可沿用仍受來源狀態與安全續接規則限制。',
     conversationAffinityQuotaTolerancePoints: '沿用來源時可接受的剩餘配額差距，單位是百分點。值越大越偏向保留原配對；不代表可用配額，也不會授權任意切換回合中的來源。',
     responseRouteMaxEntries: '最多保留多少筆 Response ID 與來源的路由紀錄。不是請求次數或併發上限；較大的值可保留更多續接紀錄，但會增加記憶體使用。',
@@ -43,7 +46,7 @@
   };
   for (const [id, text] of Object.entries(descriptions)) {
     const field = document.getElementById(id);
-    const title = field?.closest('label')?.querySelector('span');
+    const title = field?.closest('.field')?.querySelector(':scope > span') || field?.closest('label')?.querySelector('span');
     if (!title) continue;
     title.classList.add('parameter-help');
     title.tabIndex = 0;

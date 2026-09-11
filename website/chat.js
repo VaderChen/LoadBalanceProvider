@@ -12,6 +12,9 @@ function controls() {
   $('refresh').disabled = busy;
   $('clear').disabled = busy;
   $('send').disabled = busy || !$('provider').value || !$('model').value || !$('prompt').value.trim();
+  document.querySelectorAll('.quick-prompts button').forEach(button => {
+    button.disabled = busy || !$('provider').value || !$('model').value;
+  });
   $('stop').hidden = !state.controller;
   $('send').hidden = !!state.controller;
 }
@@ -142,12 +145,14 @@ function render(item) {
 $('composer').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.controller || state.loading || !$('model').value || !$('provider').value) return;
-  const prompt = $('prompt').value; if (!prompt.trim()) return;
+  const quickPrompt = event.submitter?.dataset.prompt;
+  const prompt = quickPrompt ?? $('prompt').value; if (!prompt.trim()) return;
   const label = `${$('provider').selectedOptions[0].textContent} · ${$('model').value}`;
   const messages = [...state.history, {role: 'user', content: prompt}];
   const controller = new AbortController(); state.controller = controller; notice();
   message('user', prompt, ''); const assistant = message('assistant', '', label);
-  $('prompt').value = ''; controls();
+  if (quickPrompt === undefined) $('prompt').value = '';
+  controls();
   $('status').textContent = '等待回應 · 0 秒';
   const started = performance.now(); let finished = false, timer, reader, pendingRender;
   timer = setInterval(() => { $('status').textContent = `${assistant.text ? '生成中' : '等待回應'} · ${Math.floor((performance.now() - started) / 1000)} 秒`; }, 500);

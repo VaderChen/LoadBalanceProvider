@@ -12,6 +12,10 @@ func acquireProviderDispatch(ctx context.Context, p *domain.LLMProviderConfig) (
 	return providerdispatch.Acquire(ctx, p)
 }
 
+func ConfigureDispatchProtection(settings domain.AdvancedSettingsConfig) {
+	providerdispatch.Configure(settings)
+}
+
 func dispatchProviderHTTP(client *http.Client, req *http.Request, p *domain.LLMProviderConfig) (*http.Response, error) {
 	return providerdispatch.Do(client, req, p)
 }

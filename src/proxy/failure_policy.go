@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"LoadBalanceProvider/src/providerdispatch"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,7 +36,9 @@ func EnrichFailure(err error, body string) {
 	if status.Code == "" {
 		status.Code = strings.ToLower(stringFromAny(payload["type"]))
 	}
-	status.Message = stringFromAny(payload["message"])
+	if message := strings.TrimSpace(stringFromAny(payload["message"])); message != "" {
+		status.Message = message
+	}
 	details := failureDetailsFromPayload(payload, time.Now())
 	status.Type = details.Type
 	status.QuotaResetAt = details.QuotaResetAt
@@ -84,8 +87,14 @@ func failureDetailsFromPayload(payload map[string]interface{}, now time.Time) Fa
 	if n := seconds(payload["retry_after"]); n > 0 && n <= 90*86400 {
 		d.RetryAfter = time.Duration(n * float64(time.Second))
 	}
-	if d.Code != "usage_limit_reached" && d.Code != "insufficient_quota" && d.Code != "quota_exceeded" &&
-		!strings.EqualFold(stringFromAny(payload["type"]), "usage_limit_reached") {
+	knownLimit := func(code string) bool {
+		switch code {
+		case "usage_limit_reached", "insufficient_quota", "quota_exceeded", "rate_limit_exceeded":
+			return true
+		}
+		return false
+	}
+	if !knownLimit(d.Code) && !knownLimit(d.Type) {
 		return d
 	}
 	// 配額可能按週／月恢復；拒絕異常遠的時間，避免永久隔離帳號。
@@ -150,6 +159,10 @@ type FailurePolicy struct {
 func ClassifyFailure(err error) FailurePolicy {
 	if err == nil {
 		return FailurePolicy{}
+	}
+	// 本機排隊逾時不是上游失敗，不懲罰帳號或換來源重試。
+	if errors.Is(err, providerdispatch.ErrProtectionWaitExceeded) {
+		return FailurePolicy{Request: true}
 	}
 	if errors.Is(err, context.Canceled) {
 		return FailurePolicy{Canceled: true}

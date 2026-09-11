@@ -14,6 +14,8 @@ main>#composer{flex-shrink:0;padding-bottom:env(safe-area-inset-bottom,0px)}
 .message.user .content{width:fit-content;max-width:85%;text-align:left}
 @media(max-width:600px){.message.user .content{max-width:100%}}
 .composer-input{position:relative}
+.quick-prompts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.quick-prompts button{min-height:30px;max-width:100%;padding:5px 9px;font-size:12px;line-height:1.5;text-align:left;overflow-wrap:anywhere}
 .composer-input textarea{padding-right:60px}
 .composer-actions{position:absolute;right:14px;bottom:12px;display:flex;gap:8px}
 .activity{display:inline-flex;align-items:center;gap:4px;width:26px;height:16px;flex:none}
